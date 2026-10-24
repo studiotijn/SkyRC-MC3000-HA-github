@@ -9,7 +9,9 @@ Everything Home Assistant needs for the MC3000 besides the ESPHome device.
 | `www/mc3000-card.js` | `/config/www/mc3000/mc3000-card.js` | dashboard card, resource `/local/mc3000/mc3000-card.js?v=<VERSION>` (module) |
 | `www/rapporten-live.html` | `/config/www/mc3000/rapporten-live.html` | loader for the reports table (iframe on the Rapporten tab) |
 | `dashboard.yaml` | dashboard raw config | the dashboard tabs |
-| `../tools/ha_report.py` | `/config/py_scripts/mc3000_report.py` | GitHub reports, `reports.json` export, cell DB backup, push |
+| `../tools/ha_report.py` | `/config/py_scripts/mc3000_report.py` | reports (local in HA or GitHub releases, see `mc3000_settings.yaml.example`), `reports.json` export, cell DB backup |
+| `../tools/build_reports_page.py` | `/config/py_scripts/build_reports_page.py` | reports table (local mode) |
+| `mc3000_settings.yaml.example` | `/config/mc3000_settings.yaml` | report storage choice, GitHub repo, HA URL |
 
 ## Dashboard
 

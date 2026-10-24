@@ -26,9 +26,9 @@ voltage, live charts and a report with a verdict for every test.
   pause and resume after a time limit, no more charging after *capacity protection* (suspect cell) but still the
   self-discharge test, abort with an explanation on a short or a removed cell.
 - **Live chart** of voltage, current and capacity since the start of the running program.
-- **Reports** for every finished test, published as GitHub releases (chart, measured and set values, verdict and
-  an explanation of *why* a test ended, e.g. which condition triggered a *time protection* fault), plus an
-  overview table in HA.
+- **Reports** for every finished test (chart, measured and set values, verdict and an explanation of *why* a test
+  ended, e.g. which condition triggered a *time protection* fault), stored in Home Assistant itself or as GitHub
+  releases - your choice - plus an overview table in HA.
 
 | | | |
 |---|---|---|
@@ -46,7 +46,7 @@ voltage, live charts and a report with a verdict for every test.
                                                                  ├─ ha/packages/mc3000.yaml   helpers, scripts, test sequencer
                                                                  ├─ ha/custom_templates/      charger values per cell + program
                                                                  ├─ ha/www/mc3000-card.js     the dashboard card
-                                                                 └─ tools/ha_report.py        reports -> GitHub releases
+                                                                 └─ tools/ha_report.py        reports -> HA (local) or GitHub releases
 ```
 
 - `firmware/` – standalone PlatformIO firmware used to reverse-engineer and verify the BLE protocol (serial console).
@@ -79,25 +79,28 @@ The ESP keeps a temperature emergency stop (default 47 °C) independent of HA.
    | `ha/custom_templates/mc3000.jinja` | `/config/custom_templates/mc3000.jinja` |
    | `ha/www/mc3000-card.js`, `ha/www/rapporten-live.html` | `/config/www/mc3000/` |
    | `tools/ha_report.py` | `/config/py_scripts/mc3000_report.py` |
+   | `tools/build_reports_page.py` | `/config/py_scripts/build_reports_page.py` |
 
 2. In the package, change `notify.notify` to your phone (`notify.mobile_app_…`).
 3. Add the dashboard resource `/local/mc3000/mc3000-card.js?v=1` (JavaScript module) and create a dashboard from
    [ha/dashboard.yaml](ha/dashboard.yaml).
 4. Restart Home Assistant, then open the **Cellen** tab and add your cell types and cells.
 
-### 3. Reports on GitHub (optional)
+### 3. Choose where reports are stored
 
-Test reports go to the releases of a GitHub repository of your choice (it can be private).
+Every finished test produces a report: chart, measured and set values, verdict and explanation. Pick the storage
+in `/config/mc3000_settings.yaml` (copy [ha/mc3000_settings.yaml.example](ha/mc3000_settings.yaml.example)):
 
-- `/config/secrets.yaml`: `mc3000_ha_token` (a long-lived HA token) and `mc3000_github_token` (a token with access
-  to that repository).
-- `/config/mc3000_settings.yaml`:
-  ```yaml
-  github_repo: your-user/your-reports-repo
-  ha_url: https://your-home-assistant:8123   # optional, default: HA's own external/internal URL
-  ```
-- Copy `.github/workflows/reports-page.yml` and `tools/build_reports_page.py` into that repository; the workflow
-  builds the overview table that HA pulls in hourly.
+| `report_storage` | Where | Needs |
+|---|---|---|
+| `local` (default) | Home Assistant itself, `/config/www/mc3000/reports/` (`.json`, `.svg`, `.csv`, `.md` per test); the Rapporten tab and the report pop-ups read them there | nothing extra |
+| `github` | one GitHub release per test in `github_repo` (public or private), plus an overview page built by a workflow | `mc3000_github_token` in `/config/secrets.yaml`, and `.github/workflows/reports-page.yml` + `tools/build_reports_page.py` in that repository |
+
+Both need `mc3000_ha_token` (a long-lived access token) in `/config/secrets.yaml`, because the script reads the
+measurements from HA's history. Copy `tools/build_reports_page.py` to `/config/py_scripts/` as well: in local mode it
+builds the reports table.
+
+Files under `/config/www` are served at `/local/…` without login. Fine for battery measurements, but keep it in mind.
 
 ## Safety
 

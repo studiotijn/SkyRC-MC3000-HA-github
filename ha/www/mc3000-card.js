@@ -19,7 +19,7 @@
  * Program values: params() below = custom_templates/mc3000.jinja; keep in step.
  */
 
-const VERSION = "1.0.4";
+const VERSION = "1.0.5";
 const CH = [1, 2, 3, 4];
 const DB = "sensor.mc3000_cellen";
 const PALETTE = ["#e5484d", "#f76b15", "#ffc53d", "#46a758", "#12a594", "#0090ff",
@@ -689,7 +689,7 @@ class Mc3000Card extends HTMLElement {
       <div class="sec-t">Ingesteld</div>${set}
       <div class="sec-t">Verklaring einde</div><ul class="rs">${(r.explanation || []).map((x) => `<li>${md(x)}</li>`).join("")}</ul>
       ${r.flags?.length ? `<div class="sec-t">Waarschuwingen</div><ul class="rs">${r.flags.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
-      <div class="foot">${r.url ? `<a class="btn sec" href="${esc(r.url)}" target="_blank" rel="noopener" style="text-decoration:none">Op GitHub</a>` : ""}</div>
+      <div class="foot">${r.url ? `<a class="btn sec" href="${esc(r.url)}" target="_blank" rel="noopener" style="text-decoration:none">${/^https?:/.test(r.url) ? "Op GitHub" : "Volledig rapport"}</a>` : ""}</div>
       ${others ? `<div class="sec-t">Eerdere rapporten kanaal ${ch}</div><div class="list">${others}</div>` : ""}`;
     this._openModal(`Kanaal ${ch} · rapport`, html, (body) => {
       body.querySelectorAll("[data-tag]").forEach((el) => el.addEventListener("click", () => this._openReport(ch, el.dataset.tag)));

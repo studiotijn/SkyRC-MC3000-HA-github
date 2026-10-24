@@ -27,6 +27,12 @@ Usage:
   python3 mc3000_report.py --export             (reports.json + charts for the dashboard card)
   python3 mc3000_report.py --backup-db / --restore-db   (cell database <-> /config/mc3000_cellen.json)
   python3 mc3000_report.py --push <dir>         (commit files from <dir>/manifest.txt to GitHub)
+
+Settings (/config/mc3000_settings.yaml, all optional):
+  report_storage: local | github   local = files in /config/www/mc3000/reports
+                                   (default when no github_repo is set)
+  github_repo: owner/name          repository for the releases (github mode)
+  ha_url: https://...              default: HA's external/internal URL
   python3 mc3000_report.py --channel 4 --start 2026-10-09T01:00:00+02:00 \
       --battery "Molicel P28A #3" --rated 2800 --program "Cycle C>D>C" \
       --outcome "Done"
@@ -75,6 +81,10 @@ def _default_ha_url():
 
 # GitHub repository that holds the measurement releases (owner/name).
 REPO = _settings().get("github_repo") or "your-github-user/your-reports-repo"
+# Where reports go: "local" (files in /config/www/mc3000/reports, no GitHub
+# needed) or "github" (one release per report). Default: github when a repo is
+# configured, otherwise local.
+STORAGE = (_settings().get("report_storage") or ("github" if _settings().get("github_repo") else "local")).lower()
 SECRETS = "/config/secrets.yaml"
 ESPHOME_SECRETS = "/config/esphome/secrets.yaml"
 LOG_PREFIX = "[mc3000_report]"
@@ -133,9 +143,9 @@ def load_secrets():
     gh_token = sec.get("mc3000_github_token") or _read_yaml(ESPHOME_SECRETS).get("github_token")
     if not ha_token:
         raise SystemExit(f"{LOG_PREFIX} mc3000_ha_token missing in {SECRETS}")
-    if not gh_token:
+    if not gh_token and STORAGE == "github":
         raise SystemExit(f"{LOG_PREFIX} no GitHub token: set mc3000_github_token in {SECRETS} "
-                         f"or github_token in {ESPHOME_SECRETS}")
+                         f"or github_token in {ESPHOME_SECRETS} (or report_storage: local)")
     return ha_token, gh_token
 
 
@@ -1054,7 +1064,7 @@ def build_report(ha_url, ha_token, channel, start, end, battery, rated, rated_ir
     w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
     w.writeheader()
     w.writerows(rows)
-    return {"rows": rows, "tag": tag, "title": title, "body": body, "svg": svg,
+    return {"rows": rows, "tag": tag, "title": title, "body": body, "svg": svg, "data": data,
             "csv": buf.getvalue().encode(), "chart_path": chart_path}
 
 
@@ -1322,7 +1332,154 @@ def push_dir(gh_token, src):
     print(f"parent {parent}")
 
 
+# ---------------------------------------------------------------------------
+# Local report storage (report_storage: local): every report is a set of files
+# in /config/www/mc3000/reports: <tag>.json (data), <tag>.svg (chart),
+# <tag>.csv (raw rows) and <tag>.md (the full report text). The dashboard card
+# and the reports table are built from those files; nothing leaves HA.
+# Note: /config/www is served under /local/ without login.
+# ---------------------------------------------------------------------------
+
+def _page_module():
+    """tools/build_reports_page.py, installed next to this script."""
+    import importlib.util
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("mc3000_reports_page.py", "build_reports_page.py"):
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            spec = importlib.util.spec_from_file_location("mc3000_reports_page", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+
+def local_entries():
+    import glob
+    import os
+    out = []
+    for f in glob.glob(f"{LOCAL_DIR}/reports/*.json"):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                e = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        tag = e.get("tag") or os.path.basename(f)[:-5]
+        e["tag"] = tag
+        e["svg"] = f"/local/mc3000/reports/{tag}.svg" if os.path.exists(f"{LOCAL_DIR}/reports/{tag}.svg") else None
+        e["url"] = e["html_url"] = f"/local/mc3000/reports/{tag}.md"
+        out.append(e)
+    out.sort(key=lambda e: e.get("end") or e.get("start") or "", reverse=True)
+    return out
+
+
+def write_local_index():
+    """reports.json for the card + rapporten.html (the reports table)."""
+    import os
+    entries = local_entries()
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    tmp = f"{LOCAL_DIR}/reports.json.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"generated": datetime.now().isoformat(timespec="seconds"), "reports": entries}, f,
+                  ensure_ascii=False)
+    os.replace(tmp, f"{LOCAL_DIR}/reports.json")
+    page = _page_module()
+    if page:
+        from pathlib import Path
+        page.REPORTS_DIR = Path(f"{LOCAL_DIR}/reports")
+        html_doc = page.build_page(sorted(entries, key=lambda e: (e["start"][:16], -int(e.get("channel", 0))),
+                                          reverse=True))
+        with open(PAGE_DST + ".tmp", "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        os.replace(PAGE_DST + ".tmp", PAGE_DST)
+    else:
+        log("build_reports_page.py not found next to this script, table not rebuilt")
+    log(f"local index: {len(entries)} reports")
+
+
+def save_local(rep):
+    """Store one report; returns the final tag (made unique)."""
+    import os
+    os.makedirs(f"{LOCAL_DIR}/reports", exist_ok=True)
+    tag = sanitize(rep["tag"])
+    base, n = tag, 2
+    while os.path.exists(f"{LOCAL_DIR}/reports/{tag}.json"):
+        tag, n = f"{base}-{n}", n + 1
+    data = dict(rep["data"], tag=tag, chart=f"reports/{tag}.svg")
+    body = rep["body"].replace(rep["tag"], tag).replace(
+        "{CHART}", f"### Spanning en stroom\n\n![Spanning en stroom]({tag}.svg)\n\n")
+    files = {"json": json.dumps(data, ensure_ascii=False, indent=1).encode(), "svg": rep["svg"],
+             "csv": rep["csv"], "md": f"# {rep['title']}\n\n{body}".encode()}
+    for ext, content in files.items():
+        with open(f"{LOCAL_DIR}/reports/{tag}.{ext}", "wb") as f:
+            f.write(content)
+    return tag
+
+
+def delete_local(tag):
+    import os
+    if not TAG_RE.match(tag):
+        raise SystemExit(f"{LOG_PREFIX} refusing odd tag {tag!r}")
+    gone = 0
+    for ext in ("json", "svg", "csv", "md"):
+        p = f"{LOCAL_DIR}/reports/{tag}.{ext}"
+        if os.path.exists(p):
+            os.remove(p)
+            gone += 1
+    log(f"deleted {tag} ({gone} files)")
+    write_local_index()
+
+
+def rebuild_local(ha_url, ha_token, only_tag=None, force=False):
+    done = skipped = failed = 0
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for d in local_entries():
+        tag = d["tag"]
+        if (only_tag and tag != only_tag) or (not force and d.get("analysis_version", 0) >= ANALYSIS_VERSION):
+            skipped += 1
+            continue
+        try:
+            fmt_in = "%Y-%m-%d %H:%M:%S"
+            start = datetime.strptime(d["start"], fmt_in).astimezone()
+            end = datetime.strptime(d["end"], fmt_in).astimezone()
+            ch = int(d["channel"])
+            ent, hist = fetch_history(ha_url, ha_token, ch, start, end + timedelta(minutes=5))
+            cut = infer_discharge_cutoff(build_rows(ch, ent, hist), d.get("status")) or d.get("discharge_cutoff_mv")
+            rep = build_report(ha_url, ha_token, ch, start, end + timedelta(seconds=1), d.get("battery", "Unknown"),
+                               d.get("rated_capacity_mah") or None, d.get("rated_resistance_mohm") or None,
+                               d.get("program", "Unknown"), d.get("status", "Done"), tag=tag,
+                               overrides={"discharge_cutoff_mv": cut}, cell=d.get("cell"), extra=d.get("metingen"),
+                               note=f"Analyse en grafiek opnieuw opgebouwd op {stamp}.")
+            if not rep:
+                skipped += 1
+                continue
+            delete_tag_files = [f"{LOCAL_DIR}/reports/{tag}.{x}" for x in ("json", "svg", "csv", "md")]
+            import os
+            for p in delete_tag_files:
+                if os.path.exists(p):
+                    os.remove(p)
+            save_local(rep)
+            done += 1
+        except Exception as e:
+            failed += 1
+            log(f"{tag}: FAILED {e!r}")
+    log(f"rebuild finished: {done} rebuilt, {skipped} skipped, {failed} failed")
+    write_local_index()
+
+
 def main():
+    if STORAGE == "local":
+        if "--delete" in sys.argv:
+            delete_local(sys.argv[sys.argv.index("--delete") + 1])
+            return
+        if "--sync-page" in sys.argv or "--export" in sys.argv:
+            write_local_index()
+            return
+        if "--rebuild-all" in sys.argv or "--rebuild" in sys.argv:
+            only = sys.argv[sys.argv.index("--rebuild") + 1] if "--rebuild" in sys.argv else None
+            rebuild_local(DEFAULT_HA_URL, load_secrets()[0], only_tag=only, force="--force" in sys.argv)
+            return
     if "--delete" in sys.argv:
         gh = load_gh_token()
         delete_report(gh, sys.argv[sys.argv.index("--delete") + 1])
@@ -1383,6 +1540,11 @@ def main():
                          a.program, a.outcome, **kw)
     if not probe:
         raise SystemExit(f"{LOG_PREFIX} no data for channel {a.channel} between {start} and {end}")
+    if STORAGE == "local" and not a.dry_run:
+        tag = save_local(probe)
+        write_local_index()
+        log(f"saved {tag} in {LOCAL_DIR}/reports ({len(probe['rows'])} rows)")
+        return
     tag = probe["tag"] if a.dry_run else free_tag(gh_token, probe["tag"])
     rep = probe if tag == probe["tag"] else build_report(
         a.ha_url, ha_token, a.channel, start, end, a.battery, rated, rated_ir, a.program, a.outcome, tag=tag, **kw)

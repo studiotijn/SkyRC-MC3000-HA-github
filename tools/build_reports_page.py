@@ -392,6 +392,20 @@ def render_by_battery(entries: list[dict]) -> str:
     return "".join(sections)
 
 
+def build_page(entries: list[dict]) -> str:
+    """The whole page for a list of report entries (newest first). Also used by
+    ha_report.py for local report storage (entries from local JSON files)."""
+    import datetime
+    for e in entries:
+        e.setdefault("html_url", e.get("url") or "#")
+    return PAGE_TEMPLATE % {
+        "count": len(entries),
+        "generated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "table_html": render_table(entries),
+        "battery_html": render_by_battery(entries),
+    }
+
+
 def main():
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("public")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -402,15 +416,7 @@ def main():
     # batch lines up with one pass of the row colour gradient.
     entries.sort(key=lambda e: (e["start"][:16], -int(e.get("channel", 0))), reverse=True)
 
-    import datetime
-
-    html = PAGE_TEMPLATE % {
-        "count": len(entries),
-        "generated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-        "table_html": render_table(entries),
-        "battery_html": render_by_battery(entries),
-    }
-
+    html = build_page(entries)
     (out_dir / "index.html").write_text(html, encoding="utf-8")
     print(f"Wrote {out_dir / 'index.html'} with {len(entries)} measurement(s).")
 

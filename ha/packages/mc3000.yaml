@@ -1,7 +1,7 @@
 # SkyRC MC3000 - Home Assistant package
 #
 # Dashboard "Batterijlader" (custom card /local/mc3000/mc3000-card.js) and the
-# GitHub test reports. Parts:
+# test reports (local or GitHub). Parts:
 #   - shell_command: report script /config/py_scripts/mc3000_report.py
 #   - sensor.mc3000_cellen: the cell database (types + variants), written by
 #     the card through script.mc3000_db_opslaan, backed up to
@@ -38,8 +38,6 @@ shell_command:
   # Cell database <-> /config/mc3000_cellen.json
   mc3000_db_backup: python3 /config/py_scripts/mc3000_report.py --backup-db
   mc3000_db_restore: python3 /config/py_scripts/mc3000_report.py --restore-db
-  # Commit the files in /config/mc3000_push (manifest.txt, msg.txt) to GitHub
-  mc3000_push: nohup python3 /config/py_scripts/mc3000_report.py --push /config/mc3000_push > /config/mc3000_push/result.txt 2>&1 &
 
 template:
   - triggers:

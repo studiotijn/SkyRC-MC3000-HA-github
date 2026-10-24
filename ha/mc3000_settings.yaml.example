@@ -1,0 +1,15 @@
+# Copy to /config/mc3000_settings.yaml. Everything is optional.
+
+# Where test reports are stored:
+#   local  - in Home Assistant itself: /config/www/mc3000/reports
+#            (json, chart, csv and the full report per test). No GitHub needed.
+#   github - one GitHub release per test in github_repo (can be private);
+#            needs mc3000_github_token in /config/secrets.yaml.
+# Default: github when github_repo is set, otherwise local.
+report_storage: local
+
+# github_repo: your-user/your-reports-repo
+
+# URL the report script uses to read HA's history. Default: HA's own
+# external_url / internal_url (Settings > System > Network).
+# ha_url: https://homeassistant.local:8123
