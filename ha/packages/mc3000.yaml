@@ -1,0 +1,954 @@
+# SkyRC MC3000 - Home Assistant package
+#
+# Dashboard "Batterijlader" (custom card /local/mc3000/mc3000-card.js) and the
+# GitHub test reports. Parts:
+#   - shell_command: report script /config/py_scripts/mc3000_report.py
+#   - sensor.mc3000_cellen: the cell database (types + variants), written by
+#     the card through script.mc3000_db_opslaan, backed up to
+#     /config/mc3000_cellen.json
+#   - per channel: chosen cell, running program, multi-step test state
+#   - scripts: choose cell, start/stop program, apply one charger step
+#   - automation "MC3000 programmaverloop": the quality / capacity test steps
+#     (charge, rest, discharge, IR test, storage, self-discharge) and what to do
+#     on a fault
+# Charger program values come from custom_templates/mc3000.jinja.
+
+shell_command:
+  # Templates in shell_command run without a shell (args are shlex-split), so
+  # the quoting below is safe; the callers strip quotes from free text.
+  mc3000_report: >-
+    python3 /config/py_scripts/mc3000_report.py
+    --channel {{ channel }}
+    --start '{{ start }}'
+    --battery '{{ battery }}'
+    --rated {{ rated }}
+    --program '{{ program }}'
+    --outcome '{{ outcome }}'
+    --cell '{{ cell | default('') }}'
+    --extra '{{ extra | default('') }}'
+  # docs/index.html (GitHub overview) -> /config/www/mc3000/rapporten.html and
+  # reports.json + charts for the dashboard card
+  mc3000_sync_page: python3 /config/py_scripts/mc3000_report.py --sync-page
+  # Delete one measurement (release + tag), rebuild/re-sync the page. Only
+  # plain tag names, only releases with measurement data.
+  mc3000_delete_report: python3 /config/py_scripts/mc3000_report.py --delete '{{ tag }}'
+  # Redo analysis + chart of all reports from HA's history, in the background
+  # (no template -> shell, '&'; longer than the 60 s limit).
+  mc3000_rebuild_reports: nohup python3 /config/py_scripts/mc3000_report.py --rebuild-all > /config/mc3000_rebuild.log 2>&1 &
+  # Cell database <-> /config/mc3000_cellen.json
+  mc3000_db_backup: python3 /config/py_scripts/mc3000_report.py --backup-db
+  mc3000_db_restore: python3 /config/py_scripts/mc3000_report.py --restore-db
+  # Commit the files in /config/mc3000_push (manifest.txt, msg.txt) to GitHub
+  mc3000_push: nohup python3 /config/py_scripts/mc3000_report.py --push /config/mc3000_push > /config/mc3000_push/result.txt 2>&1 &
+
+template:
+  - triggers:
+      - trigger: event
+        event_type: mc3000_db_set
+    sensor:
+      - name: MC3000 cellen
+        unique_id: mc3000_cellen_db
+        icon: mdi:database-outline
+        state: "{{ trigger.event.data.cells | default({}) | count }}"
+        attributes:
+          types: "{{ trigger.event.data.types | default({}) }}"
+          cells: "{{ trigger.event.data.cells | default({}) }}"
+          bijgewerkt: "{{ now().isoformat() }}"
+
+input_boolean:
+  mc3000_zelfontlading:
+    name: MC3000 zelfontladingstest in kwaliteitstest
+    icon: mdi:timer-sand
+
+input_text:
+  mc3000_ch1_cel:
+    name: MC3000 Ch1 cel
+    max: 40
+    icon: mdi:battery-outline
+  mc3000_ch1_programma:
+    name: MC3000 Ch1 programma
+    max: 40
+    icon: mdi:play-box-outline
+  mc3000_ch1_kt:
+    name: MC3000 Ch1 testverloop
+    max: 120
+    icon: mdi:list-status
+  mc3000_ch1_kt_data:
+    name: MC3000 Ch1 testmetingen
+    max: 255
+    icon: mdi:clipboard-text-outline
+  mc3000_ch1_kt_log:
+    name: MC3000 Ch1 testlog
+    max: 255
+    icon: mdi:history
+  mc3000_ch2_cel:
+    name: MC3000 Ch2 cel
+    max: 40
+    icon: mdi:battery-outline
+  mc3000_ch2_programma:
+    name: MC3000 Ch2 programma
+    max: 40
+    icon: mdi:play-box-outline
+  mc3000_ch2_kt:
+    name: MC3000 Ch2 testverloop
+    max: 120
+    icon: mdi:list-status
+  mc3000_ch2_kt_data:
+    name: MC3000 Ch2 testmetingen
+    max: 255
+    icon: mdi:clipboard-text-outline
+  mc3000_ch2_kt_log:
+    name: MC3000 Ch2 testlog
+    max: 255
+    icon: mdi:history
+  mc3000_ch3_cel:
+    name: MC3000 Ch3 cel
+    max: 40
+    icon: mdi:battery-outline
+  mc3000_ch3_programma:
+    name: MC3000 Ch3 programma
+    max: 40
+    icon: mdi:play-box-outline
+  mc3000_ch3_kt:
+    name: MC3000 Ch3 testverloop
+    max: 120
+    icon: mdi:list-status
+  mc3000_ch3_kt_data:
+    name: MC3000 Ch3 testmetingen
+    max: 255
+    icon: mdi:clipboard-text-outline
+  mc3000_ch3_kt_log:
+    name: MC3000 Ch3 testlog
+    max: 255
+    icon: mdi:history
+  mc3000_ch4_cel:
+    name: MC3000 Ch4 cel
+    max: 40
+    icon: mdi:battery-outline
+  mc3000_ch4_programma:
+    name: MC3000 Ch4 programma
+    max: 40
+    icon: mdi:play-box-outline
+  mc3000_ch4_kt:
+    name: MC3000 Ch4 testverloop
+    max: 120
+    icon: mdi:list-status
+  mc3000_ch4_kt_data:
+    name: MC3000 Ch4 testmetingen
+    max: 255
+    icon: mdi:clipboard-text-outline
+  mc3000_ch4_kt_log:
+    name: MC3000 Ch4 testlog
+    max: 255
+    icon: mdi:history
+
+input_datetime:
+  mc3000_ch1_kt_moment:
+    name: MC3000 Ch1 volgende teststap
+    has_date: true
+    has_time: true
+  mc3000_ch2_kt_moment:
+    name: MC3000 Ch2 volgende teststap
+    has_date: true
+    has_time: true
+  mc3000_ch3_kt_moment:
+    name: MC3000 Ch3 volgende teststap
+    has_date: true
+    has_time: true
+  mc3000_ch4_kt_moment:
+    name: MC3000 Ch4 volgende teststap
+    has_date: true
+    has_time: true
+
+script:
+  mc3000_db_opslaan:
+    alias: MC3000 celdatabase opslaan
+    description: Slaat de celdatabase van het dashboard op (sensor.mc3000_cellen) en maakt een backup.
+    mode: queued
+    fields:
+      types:
+        description: "Celtypes: {id: {name, chem, cap, chg_std, dis_max, v_max, v_cut, v_store, ir}}"
+        required: true
+        selector:
+          object:
+      cells:
+        description: "Cellen: {id: {type, print, note, color, fav}}"
+        required: true
+        selector:
+          object:
+    sequence:
+      - event: mc3000_db_set
+        event_data:
+          types: "{{ types }}"
+          cells: "{{ cells }}"
+      - delay: 1
+      - action: shell_command.mc3000_db_backup
+        continue_on_error: true
+
+  mc3000_cel_kiezen:
+    alias: MC3000 cel kiezen
+    description: Zet een cel uit de database op een kanaal (naam, nominale capaciteit en IR voor het rapport).
+    mode: queued
+    fields:
+      channel:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 4
+      cell:
+        description: Cel-id uit sensor.mc3000_cellen, leeg = geen
+        selector:
+          text:
+    sequence:
+      - variables:
+          cel: "{{ cell | default('', true) }}"
+          p: >-
+            {% from 'mc3000.jinja' import mc3000_params %}{{ mc3000_params(cel, 'laden') | from_json }}
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.mc3000_ch{{ channel | int }}_cel"
+        data:
+          value: "{{ cel }}"
+      - if:
+          - condition: template
+            value_template: "{{ p.ok }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: "input_text.mc3000_ch{{ channel | int }}_batterij"
+            data:
+              value: "{{ p.label | replace(\"'\", '') }}"
+          - action: input_number.set_value
+            target:
+              entity_id: "input_number.mc3000_ch{{ channel | int }}_nominale_capaciteit"
+            data:
+              value: "{{ p.cap }}"
+          - action: input_number.set_value
+            target:
+              entity_id: "input_number.mc3000_ch{{ channel | int }}_nominale_weerstand"
+            data:
+              value: "{{ p.ir }}"
+
+  mc3000_programma_start:
+    alias: MC3000 programma starten
+    description: >-
+      Start een programma op één kanaal met de waarden van de gekozen cel.
+      kwaliteit en capaciteit lopen in stappen via de automation "MC3000 programmaverloop";
+      de andere gaan in één keer naar de lader.
+    mode: queued
+    fields:
+      channel:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 4
+      program:
+        required: true
+        selector:
+          select:
+            options: [kwaliteit, capaciteit, laden, ontladen, opslag, cyclus, refresh, ir]
+    sequence:
+      - variables:
+          ch: "{{ channel | int }}"
+          cel: "{{ states('input_text.mc3000_ch' ~ (channel | int) ~ '_cel') }}"
+          p: >-
+            {% from 'mc3000.jinja' import mc3000_params %}{{ mc3000_params(cel, 'laden') | from_json }}
+      - if:
+          - condition: template
+            value_template: "{{ not p.ok }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: "mc3000_start_ch{{ ch }}"
+              title: "MC3000 Ch{{ ch }}: geen cel gekozen"
+              message: Kies eerst een cel voor dit kanaal (tik op het kanaal in het dashboard).
+          - stop: Geen cel gekozen
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.mc3000_ch{{ ch }}_programma"
+        data:
+          value: "{{ program }}"
+      - if:
+          - condition: template
+            value_template: "{{ program in ['kwaliteit', 'capaciteit'] }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: "input_text.mc3000_ch{{ ch }}_kt_data"
+            data:
+              value: ""
+          - action: input_text.set_value
+            target:
+              entity_id: "input_text.mc3000_ch{{ ch }}_kt_log"
+            data:
+              value: ""
+          - action: input_text.set_value
+            target:
+              entity_id: "input_text.mc3000_ch{{ ch }}_kt"
+            data:
+              value: "start|0|{{ now().timestamp() | int }}||1"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "input_datetime.mc3000_ch{{ ch }}_start"
+            data:
+              timestamp: "{{ now().timestamp() }}"
+          - action: script.mc3000_kt_fase
+            data:
+              channel: "{{ ch }}"
+              fase: "{{ 'laden1' if program == 'kwaliteit' else 'cd' }}"
+        else:
+          - action: input_text.set_value
+            target:
+              entity_id: "input_text.mc3000_ch{{ ch }}_kt"
+            data:
+              value: ""
+          - action: script.mc3000_toepassen
+            data:
+              channel: "{{ ch }}"
+              program: "{{ program }}"
+
+  mc3000_programma_stop:
+    alias: MC3000 programma stoppen
+    description: Stopt het kanaal en breekt een lopende kwaliteits- of capaciteitstest af.
+    mode: queued
+    fields:
+      channel:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 4
+    sequence:
+      - variables:
+          ch: "{{ channel | int }}"
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.mc3000_ch{{ ch }}_kt"
+        data:
+          value: "{{ 'gestopt|' ~ (states('input_text.mc3000_ch' ~ ch ~ '_kt').split('|')[1:] | join('|')) }}"
+      - action: switch.turn_off
+        target:
+          entity_id: "switch.skyrc_mc3000_ch{{ ch }}_charging"
+
+  mc3000_toepassen:
+    alias: MC3000 stap naar de lader sturen
+    description: >-
+      Zet de programmawaarden van de cel op het kanaal (via de gedeelde programma-entiteiten
+      van de ESP, één kanaal tegelijk) en start. program: laden, ontladen, opslag, cd,
+      cyclus, refresh, capaciteit (ESP C>D>Storage) of ir (IR-test 15 s).
+    mode: queued
+    max: 20
+    fields:
+      channel:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 4
+      program:
+        required: true
+        selector:
+          text:
+      factor:
+        description: Stroomfactor 0,5-1 (lager na een temperatuurfout)
+        selector:
+          number:
+            min: 0.5
+            max: 1
+            step: 0.05
+    sequence:
+      - variables:
+          ch: "{{ channel | int }}"
+          cel: "{{ states('input_text.mc3000_ch' ~ (channel | int) ~ '_cel') }}"
+          p: >-
+            {% from 'mc3000.jinja' import mc3000_params %}{{ mc3000_params(cel, program, factor | default(1)) | from_json }}
+      - condition: template
+        value_template: "{{ p.ok }}"
+      - if:
+          - condition: template
+            value_template: "{{ states('select.skyrc_mc3000_program_battery_type') != p.bt }}"
+        then:
+          - action: select.select_option
+            target:
+              entity_id: select.skyrc_mc3000_program_battery_type
+            data:
+              option: "{{ p.bt }}"
+          - alias: De ESP zet bij een ander batterijtype eerst zijn eigen standaardspanningen
+            delay: 2
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_capacity
+        data:
+          value: "{{ p.caplimit }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_charge_current
+        data:
+          value: "{{ p.chg }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_discharge_current
+        data:
+          value: "{{ p.dis }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_charge_cutoff_voltage
+        data:
+          value: "{{ p.v_max }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_discharge_cutoff_voltage
+        data:
+          value: "{{ p.v_cut }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_charge_end_current
+        data:
+          value: "{{ p.endc }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_discharge_end_current
+        data:
+          value: "{{ p.dis_end }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_time_cutoff
+        data:
+          value: "{{ p.tcut }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_temperature_cutoff
+        data:
+          value: "{{ p.temp }}"
+      - if:
+          - condition: template
+            value_template: "{{ 2000 <= p.v_store <= 4000 }}"
+        then:
+          - action: number.set_value
+            target:
+              entity_id: number.skyrc_mc3000_program_storage_voltage
+            data:
+              value: "{{ p.v_store }}"
+      - action: number.set_value
+        target:
+          entity_id: number.skyrc_mc3000_program_cycle_count
+        data:
+          value: 1
+      - action: select.select_option
+        target:
+          entity_id: select.skyrc_mc3000_program_mode
+        data:
+          option: "{{ p.mode }}"
+      - action: select.select_option
+        target:
+          entity_id: select.skyrc_mc3000_program_cycle_mode
+        data:
+          option: "{{ p.cycle_mode }}"
+      - alias: Alleen dit kanaal als doel
+        action: switch.turn_on
+        target:
+          entity_id: "switch.skyrc_mc3000_program_apply_to_channel_{{ ch }}"
+      - action: switch.turn_off
+        target:
+          entity_id: >-
+            {{ [1, 2, 3, 4] | reject('eq', ch) | map('string')
+               | map('regex_replace', '^', 'switch.skyrc_mc3000_program_apply_to_channel_') | list }}
+      - delay: 1
+      - action: button.press
+        target:
+          entity_id: >-
+            {{ 'button.skyrc_mc3000_program_ir_test_selected_channels' if program == 'ir'
+               else 'button.skyrc_mc3000_program_apply_to_selected_channels' }}
+      - alias: De ESP neemt de waarden bij het indrukken over; even wachten voor het volgende kanaal
+        delay: 3
+
+  mc3000_kt_fase:
+    alias: MC3000 teststap starten
+    description: >-
+      Intern (automation MC3000 programmaverloop): zet de volgende stap van een kwaliteits- of
+      capaciteitstest en voert die uit (lader-stap, rust met timer, IR-test).
+    mode: queued
+    max: 20
+    fields:
+      channel:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 4
+      fase:
+        required: true
+        selector:
+          text:
+      poging:
+        selector:
+          number:
+            min: 0
+            max: 9
+      hervat:
+        selector:
+          text:
+      factor:
+        selector:
+          number:
+            min: 0.5
+            max: 1
+            step: 0.05
+    sequence:
+      - variables:
+          ch: "{{ channel | int }}"
+          old: "{{ (states('input_text.mc3000_ch' ~ (channel | int) ~ '_kt') ~ '|||||').split('|') }}"
+          n_poging: "{{ poging if poging is defined else (old[1] | int(0)) }}"
+          n_hervat: "{{ hervat if hervat is defined else old[3] }}"
+          n_factor: "{{ factor if factor is defined else (old[4] | float(1)) }}"
+          t0: "{{ old[2] if old[2] else (now().timestamp() | int) }}"
+          minuten: "{{ {'rust1': 30, 'rust2': 30, 'rust3': 30, 'ir': 3, 'zo_wacht': 60, 'zo_meet': 1440, 'koelen': 15, 'pauze': 15}.get(fase, 0) }}"
+          logtxt: "{{ states('input_text.mc3000_ch' ~ (channel | int) ~ '_kt_log') }}"
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.mc3000_ch{{ ch }}_kt"
+        data:
+          value: "{{ fase }}|{{ n_poging }}|{{ t0 }}|{{ n_hervat }}|{{ n_factor }}"
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.mc3000_ch{{ ch }}_kt_log"
+        data:
+          value: "{{ ((logtxt ~ '|' if logtxt not in ['', 'unknown'] else '') ~ fase ~ ' ' ~ now().strftime('%d-%m %H:%M'))[-255:] }}"
+      - if:
+          - condition: template
+            value_template: "{{ minuten | int > 0 }}"
+        then:
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "input_datetime.mc3000_ch{{ ch }}_kt_moment"
+            data:
+              timestamp: "{{ (now() + timedelta(minutes=minuten | int)).timestamp() }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ fase in ['laden1', 'laden2'] }}"
+            sequence:
+              - action: script.mc3000_toepassen
+                data:
+                  channel: "{{ ch }}"
+                  program: laden
+                  factor: "{{ n_factor }}"
+          - conditions:
+              - condition: template
+                value_template: "{{ fase in ['ontladen', 'opslag', 'cd', 'ir'] }}"
+            sequence:
+              - action: script.mc3000_toepassen
+                data:
+                  channel: "{{ ch }}"
+                  program: "{{ fase }}"
+                  factor: "{{ n_factor }}"
+
+  mc3000_kt_rapport:
+    alias: MC3000 testrapport publiceren
+    description: Intern, publiceert één rapport over de hele kwaliteits- of capaciteitstest.
+    mode: parallel
+    fields:
+      channel:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 4
+      outcome:
+        selector:
+          text:
+      eind:
+        description: Eindstatus van de test (klaar of afgebroken)
+        selector:
+          text:
+    sequence:
+      - variables:
+          ch: "{{ channel | int }}"
+          kt: "{{ (states('input_text.mc3000_ch' ~ (channel | int) ~ '_kt') ~ '|||||').split('|') }}"
+          prog: "{{ states('input_text.mc3000_ch' ~ (channel | int) ~ '_programma') }}"
+          uitkomst: "{{ (outcome | default('Done', true)) | replace(\"'\", '') }}"
+      - alias: >-
+          Even wachten: de automation "MC3000 rapport publiceren" ziet de test dan nog als lopend
+          en maakt geen eigen rapport van de laatste stap
+        delay: 5
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.mc3000_ch{{ ch }}_kt"
+        data:
+          value: "{{ eind | default('klaar', true) }}|{{ kt[1] }}|{{ kt[2] }}||{{ kt[4] }}"
+      - action: shell_command.mc3000_report
+        continue_on_error: true
+        response_variable: result
+        data:
+          channel: "{{ ch }}"
+          start: "{{ (kt[2] | int(0) | as_datetime | as_local).isoformat() if kt[2] | int(0) > 0 else (now() - timedelta(hours=48)).isoformat() }}"
+          battery: "{{ states('input_text.mc3000_ch' ~ ch ~ '_batterij') | replace(\"'\", '') }}"
+          rated: "{{ states('input_number.mc3000_ch' ~ ch ~ '_nominale_capaciteit') | int(0) }}"
+          program: "{{ 'Kwaliteitstest' if prog == 'kwaliteit' else 'Capaciteitstest' }}"
+          outcome: "{{ uitkomst }}"
+          cell: "{{ states('input_text.mc3000_ch' ~ ch ~ '_cel') }}"
+          extra: >-
+            {{ (states('input_text.mc3000_ch' ~ ch ~ '_kt_data') ~ ';log=' ~ states('input_text.mc3000_ch' ~ ch ~ '_kt_log'))
+               | replace("'", '') }}
+      # Change to your phone, e.g. notify.mobile_app_<your_phone>
+      - action: notify.notify
+        continue_on_error: true
+        data:
+          title: "MC3000 Ch{{ ch }}: {{ 'kwaliteitstest' if prog == 'kwaliteit' else 'capaciteitstest' }} {{ 'klaar' if uitkomst == 'Done' else 'afgebroken' }}"
+          message: >-
+            {% if result is defined and result.returncode == 0 %}Rapport gepubliceerd, staat zo op het dashboard.
+            {% else %}Rapport publiceren mislukt, zie de melding in HA.{% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ result is not defined or result.returncode != 0 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: "mc3000_report_ch{{ ch }}"
+              title: "MC3000 Ch{{ ch }}: rapport mislukt"
+              message: "{{ (result.stderr ~ result.stdout if result is defined else 'shell_command niet beschikbaar')[-600:] }}"
+      - delay:
+          minutes: 3
+      - action: shell_command.mc3000_sync_page
+        continue_on_error: true
+
+automation:
+  - id: mc3000_programmaverloop
+    alias: MC3000 programmaverloop
+    description: >-
+      Stuurt de kwaliteitstest (laden, 30 min rust, ontladen 0,2C, 30 min rust, opnieuw laden,
+      30 min rust, IR-test, opslagspanning, zelfontlading 1 u + 24 u, rapport) en de
+      capaciteitstest (C>D, opslagspanning, rapport) stap voor stap. Bij een fout: temperatuur ->
+      afkoelen tot 32 °C en met 25% minder stroom hervatten (max. 2x); tijdslimiet -> 15 min pauze
+      en stap hervatten (1x), daarna door; capacity protection -> niet verder laden, rust- en
+      zelfontladingstest, dan opslag; onderbreking/kortsluiting/cel weg -> afbreken met rapport;
+      voedingsfout -> 15 min pauze en hervatten (max. 2x).
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id: &status
+          - sensor.skyrc_mc3000_ch1_status
+          - sensor.skyrc_mc3000_ch2_status
+          - sensor.skyrc_mc3000_ch3_status
+          - sensor.skyrc_mc3000_ch4_status
+        from: [Charging, Discharging, Paused]
+        to: Done
+        id: klaar
+      - trigger: state
+        entity_id: *status
+        from: [Charging, Discharging, Paused]
+        not_to: [Charging, Discharging, Paused, Done, Standby, unavailable, unknown]
+        id: fout
+      - trigger: state
+        entity_id: *status
+        from: [Charging, Discharging, Paused]
+        to: Standby
+        for:
+          seconds: 60
+        id: gestopt
+      - trigger: time
+        at:
+          - input_datetime.mc3000_ch1_kt_moment
+          - input_datetime.mc3000_ch2_kt_moment
+          - input_datetime.mc3000_ch3_kt_moment
+          - input_datetime.mc3000_ch4_kt_moment
+        id: timer
+      - trigger: numeric_state
+        entity_id:
+          - sensor.skyrc_mc3000_ch1_voltage
+          - sensor.skyrc_mc3000_ch2_voltage
+          - sensor.skyrc_mc3000_ch3_voltage
+          - sensor.skyrc_mc3000_ch4_voltage
+        below: 0.5
+        for:
+          minutes: 2
+        id: leeg
+    variables:
+      ch: "{{ trigger.entity_id | regex_findall_index('_ch(\\d)_') | int }}"
+      kt: "{{ (states('input_text.mc3000_ch' ~ ch ~ '_kt') ~ '|||||').split('|') }}"
+      fase: "{{ kt[0] }}"
+      poging: "{{ kt[1] | int(0) }}"
+      factor: "{{ kt[4] | float(1) }}"
+      prog: "{{ states('input_text.mc3000_ch' ~ ch ~ '_programma') }}"
+      data: "{{ states('input_text.mc3000_ch' ~ ch ~ '_kt_data') if states('input_text.mc3000_ch' ~ ch ~ '_kt_data') not in ['unknown', 'unavailable'] else '' }}"
+      mv: "{{ (states('sensor.skyrc_mc3000_ch' ~ ch ~ '_voltage') | float(0) * 1000) | round(0) | int }}"
+      temp: "{{ states('sensor.skyrc_mc3000_ch' ~ ch ~ '_temperature') | float(0) }}"
+      lader_stap: "{{ fase in ['laden1', 'laden2', 'ontladen', 'opslag', 'cd'] }}"
+      rust_stap: "{{ fase in ['rust1', 'rust2', 'rust3', 'ir', 'zo_wacht', 'zo_meet', 'koelen', 'pauze'] }}"
+      reeks: >-
+        {% if prog == 'kwaliteit' %}{{ ['laden1', 'rust1', 'ontladen', 'rust2', 'laden2', 'rust3', 'ir', 'opslag']
+           + (['zo_wacht', 'zo_meet'] if is_state('input_boolean.mc3000_zelfontlading', 'on') else []) + ['rapport'] }}
+        {%- else %}{{ ['cd', 'opslag', 'rapport'] }}{% endif %}
+      volgende: >-
+        {% if fase == 'zo_meet' and 'cp=1' in data and 'opslag ' not in states('input_text.mc3000_ch' ~ ch ~ '_kt_log') %}opslag
+        {%- elif fase == 'opslag' and 'sd=' in data %}rapport
+        {%- elif fase in reeks %}{{ reeks[reeks.index(fase) + 1] }}
+        {%- else %}rapport{% endif %}
+    conditions:
+      - alias: Alleen kanalen met een lopende kwaliteits- of capaciteitstest
+        condition: template
+        value_template: "{{ prog in ['kwaliteit', 'capaciteit'] and (lader_stap or rust_stap) }}"
+    actions:
+      - choose:
+          # ---------------- stap klaar -----------------------------------
+          - alias: Lader-stap klaar -> meten, volgende stap
+            conditions:
+              - condition: trigger
+                id: klaar
+              - condition: template
+                value_template: "{{ lader_stap }}"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ fase == 'laden1' }}"
+                then:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: "input_text.mc3000_ch{{ ch }}_kt_data"
+                    data:
+                      value: "{{ (data ~ ';v_vol=' ~ mv).lstrip(';') }}"
+              - action: script.turn_on
+                target:
+                  entity_id: "{{ 'script.mc3000_kt_rapport' if volgende == 'rapport' else 'script.mc3000_kt_fase' }}"
+                data:
+                  variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0} }}"
+          # ---------------- timer --------------------------------------
+          - alias: Rust/wachttijd voorbij
+            conditions:
+              - condition: trigger
+                id: timer
+              - condition: template
+                value_template: "{{ rust_stap }}"
+            sequence:
+              - variables:
+                  irs: "sensor.skyrc_mc3000_ch{{ ch }}_ir_test"
+                  ir_ok: >-
+                    {{ states(irs) | is_number and states(irs) | float(0) > 0 and states[irs] is not none
+                       and (now() - states[irs].last_reported).total_seconds() < 300 }}
+                  sd0: "{{ (data | regex_findall_index('sd0=(\\d+)') if 'sd0=' in data else mv) | int(0) }}"
+                  nieuw: >-
+                    {% if fase == 'rust1' %};v_rust={{ mv }}
+                    {%- elif fase == 'rust2' %};v_leeg={{ mv }}
+                    {%- elif fase == 'ir' and ir_ok %};ir={{ states(irs) | float | round(0) | int }}
+                    {%- elif fase == 'zo_wacht' %};sd0={{ mv }}
+                    {%- elif fase == 'zo_meet' %};sd={{ [sd0 - mv, 0] | max }}{% endif %}
+              - if:
+                  - condition: template
+                    value_template: "{{ nieuw != '' }}"
+                then:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: "input_text.mc3000_ch{{ ch }}_kt_data"
+                    data:
+                      value: "{{ (data ~ nieuw).lstrip(';')[:255] }}"
+              - choose:
+                  - alias: Afkoelen nog niet klaar
+                    conditions:
+                      - condition: template
+                        value_template: "{{ fase == 'koelen' and temp > 32 }}"
+                    sequence:
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.mc3000_kt_fase
+                        data:
+                          variables:
+                            channel: "{{ ch }}"
+                            fase: koelen
+                  - alias: Afkoelen / pauze klaar -> stap hervatten
+                    conditions:
+                      - condition: template
+                        value_template: "{{ fase in ['koelen', 'pauze'] }}"
+                    sequence:
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.mc3000_kt_fase
+                        data:
+                          variables:
+                            channel: "{{ ch }}"
+                            fase: "{{ kt[3] if kt[3] else 'opslag' }}"
+                default:
+                  - action: script.turn_on
+                    target:
+                      entity_id: "{{ 'script.mc3000_kt_rapport' if volgende == 'rapport' else 'script.mc3000_kt_fase' }}"
+                    data:
+                      variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0} }}"
+          # ---------------- fout van de lader --------------------------
+          - alias: Fout tijdens een lader-stap
+            conditions:
+              - condition: trigger
+                id: fout
+              - condition: template
+                value_template: "{{ lader_stap }}"
+            sequence:
+              - variables:
+                  fout: "{{ trigger.to_state.state }}"
+                  notitie: "{{ fout | replace('FAULT: ', '') }} tijdens {{ fase }}"
+              - action: input_text.set_value
+                target:
+                  entity_id: "input_text.mc3000_ch{{ ch }}_kt_log"
+                data:
+                  value: "{{ (states('input_text.mc3000_ch' ~ ch ~ '_kt_log') ~ '|FOUT ' ~ (fout | replace('FAULT: ', '')))[-255:] }}"
+              - choose:
+                  - alias: Capacity protection -> niet verder laden; rust/zelfontlading en opslag
+                    conditions:
+                      - condition: template
+                        value_template: "{{ 'capacity protection' in fout and fase != 'opslag' }}"
+                    sequence:
+                      - action: input_text.set_value
+                        target:
+                          entity_id: "input_text.mc3000_ch{{ ch }}_kt_data"
+                        data:
+                          value: "{{ (data ~ ';cp=1;notes=Capacity protection tijdens ' ~ fase ~ ': er ging meer lading in dan 1,25x de nominale capaciteit zonder dat de cel vol raakte. Niet verder geladen.').lstrip(';')[:255] }}"
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.mc3000_kt_fase
+                        data:
+                          variables:
+                            channel: "{{ ch }}"
+                            fase: "{{ 'zo_wacht' if 'zo_wacht' in reeks else 'opslag' }}"
+                            poging: 0
+                  - alias: Temperatuur -> afkoelen, met minder stroom hervatten (max. 2x)
+                    conditions:
+                      - condition: template
+                        value_template: "{{ 'temperature' in fout and poging < 2 }}"
+                    sequence:
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.mc3000_kt_fase
+                        data:
+                          variables:
+                            channel: "{{ ch }}"
+                            fase: koelen
+                            poging: "{{ poging + 1 }}"
+                            hervat: "{{ fase }}"
+                            factor: "{{ [factor * 0.75, 0.5] | max | round(2) }}"
+                  - alias: Tijdslimiet -> 15 min pauze en hervatten (1x), daarna door
+                    conditions:
+                      - condition: template
+                        value_template: "{{ 'time protection' in fout }}"
+                    sequence:
+                      - if:
+                          - condition: template
+                            value_template: "{{ poging < 1 and fase != 'opslag' }}"
+                        then:
+                          - action: script.turn_on
+                            target:
+                              entity_id: script.mc3000_kt_fase
+                            data:
+                              variables:
+                                channel: "{{ ch }}"
+                                fase: pauze
+                                poging: "{{ poging + 1 }}"
+                                hervat: "{{ fase }}"
+                        else:
+                          - action: input_text.set_value
+                            target:
+                              entity_id: "input_text.mc3000_ch{{ ch }}_kt_data"
+                            data:
+                              value: "{{ (data ~ ';notes=Tijdslimiet ook na hervatten bereikt tijdens ' ~ fase ~ ', stap als klaar beschouwd.').lstrip(';')[:255] }}"
+                          - action: script.turn_on
+                            target:
+                              entity_id: "{{ 'script.mc3000_kt_rapport' if volgende == 'rapport' else 'script.mc3000_kt_fase' }}"
+                            data:
+                              variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0} }}"
+                  - alias: Voedingsfout -> 15 min pauze en hervatten (max. 2x)
+                    conditions:
+                      - condition: template
+                        value_template: "{{ ('input voltage' in fout or 'MCP3424' in fout) and poging < 2 }}"
+                    sequence:
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.mc3000_kt_fase
+                        data:
+                          variables:
+                            channel: "{{ ch }}"
+                            fase: pauze
+                            poging: "{{ poging + 1 }}"
+                            hervat: "{{ fase }}"
+                default:
+                  - alias: Onderbreking, kortsluiting, ompoling of te vaak dezelfde fout -> afbreken
+                    action: script.turn_on
+                    target:
+                      entity_id: script.mc3000_kt_rapport
+                    data:
+                      variables:
+                        channel: "{{ ch }}"
+                        outcome: "{{ fout }}"
+                        eind: afgebroken
+          # ---------------- kanaal gestopt -----------------------------
+          - alias: Kanaal gestopt (ESP-noodstop bij hitte of handmatig)
+            conditions:
+              - condition: trigger
+                id: gestopt
+              - condition: template
+                value_template: "{{ lader_stap }}"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ temp >= 43 and poging < 2 }}"
+                then:
+                  - action: script.turn_on
+                    target:
+                      entity_id: script.mc3000_kt_fase
+                    data:
+                      variables:
+                        channel: "{{ ch }}"
+                        fase: koelen
+                        poging: "{{ poging + 1 }}"
+                        hervat: "{{ fase }}"
+                        factor: "{{ [factor * 0.75, 0.5] | max | round(2) }}"
+                else:
+                  - action: script.turn_on
+                    target:
+                      entity_id: script.mc3000_kt_rapport
+                    data:
+                      variables:
+                        channel: "{{ ch }}"
+                        outcome: Stopped (manual, safety stop or battery removed)
+                        eind: afgebroken
+          # ---------------- cel uit het slot ----------------------------
+          - alias: Cel verwijderd tijdens rust
+            conditions:
+              - condition: trigger
+                id: leeg
+              - condition: template
+                value_template: "{{ rust_stap }}"
+            sequence:
+              - action: script.turn_on
+                target:
+                  entity_id: script.mc3000_kt_rapport
+                data:
+                  variables:
+                    channel: "{{ ch }}"
+                    outcome: "FAULT: connection break"
+                    eind: afgebroken
+
+  - id: mc3000_programmaverloop_herstel
+    alias: MC3000 programmaverloop na herstart
+    description: Een teststap waarvan de wachttijd tijdens een herstart verliep, alsnog 1 minuut na de start afronden.
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay:
+          minutes: 1
+      - repeat:
+          for_each: [1, 2, 3, 4]
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >-
+                    {% set f = states('input_text.mc3000_ch' ~ repeat.item ~ '_kt').split('|')[0] %}
+                    {% set m = as_datetime(states('input_datetime.mc3000_ch' ~ repeat.item ~ '_kt_moment'), none) %}
+                    {{ f in ['rust1', 'rust2', 'rust3', 'ir', 'zo_wacht', 'zo_meet', 'koelen', 'pauze']
+                       and m is not none and (m | as_local) < now() }}
+              then:
+                - action: input_datetime.set_datetime
+                  target:
+                    entity_id: "input_datetime.mc3000_ch{{ repeat.item }}_kt_moment"
+                  data:
+                    timestamp: "{{ (now() + timedelta(minutes=1)).timestamp() }}"

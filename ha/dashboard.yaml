@@ -1,0 +1,44 @@
+# Example dashboard (Settings > Dashboards > Add dashboard > New dashboard
+# from scratch > three dots > Raw configuration editor). Needs the resource
+# /local/mc3000/mc3000-card.js (type: JavaScript module).
+views:
+  - title: Overzicht
+    path: mc3000
+    icon: mdi:battery-charging-high
+    type: panel
+    cards:
+      - type: custom:mc3000-card
+        view: overzicht
+        reports_path: rapporten
+        # reports_url: https://github.com/<you>/<reports-repo>/releases
+  - title: Cellen
+    path: cellen
+    icon: mdi:database-outline
+    type: panel
+    cards:
+      - type: custom:mc3000-card
+        view: cellen
+  - title: Programma's
+    path: programmas
+    icon: mdi:format-list-checks
+    type: panel
+    cards:
+      - type: custom:mc3000-card
+        view: programmas
+  - title: Rapporten
+    path: rapporten
+    icon: mdi:table-large
+    type: sections
+    max_columns: 4
+    sections:
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Rapporten
+            icon: mdi:file-chart-outline
+          - type: iframe
+            url: /local/mc3000/rapporten-live.html
+            grid_options:
+              columns: full
+              rows: 14

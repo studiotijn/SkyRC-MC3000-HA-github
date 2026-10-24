@@ -1,0 +1,25 @@
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/.browse.c_cpp.db*
+firmware/.vscode/c_cpp_properties.json
+firmware/.vscode/launch.json
+firmware/.vscode/ipch
+
+# Local tooling config (not shared project config)
+.claude/settings.local.json
+
+# Third-party binaries (copyrighted, not ours to redistribute)
+apk/
+
+# ESPHome secrets and build output
+esphome/secrets.yaml
+esphome/.esphome/
+__pycache__/
+
+# Local tool output (ad hoc test logs, not project artifacts)
+tools/cycle_test_log.csv
+tools/cycle_test_report.txt
+
+# Misc
+*.log
+serial_capture.txt

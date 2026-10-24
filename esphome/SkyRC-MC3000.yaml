@@ -1,0 +1,1562 @@
+# Example ESPHome config for the SkyRC MC3000 external_component.
+#
+# Adapted from a working esp32-c6-devkitc-1 + ble_client config (same board,
+# same esp-idf framework requirement) - see README.md "Phase 2" for why
+# esp-idf (not Arduino) is required here, unlike firmware/ which is Arduino.
+#
+# Fill in secrets.yaml (see secrets.yaml.example): wifi_ssid, wifi_password,
+# api_key (any base64 32-byte key) and mc3000_mac, the BLE address of your
+# charger (scan for it with the esp32_ble_tracker logs or a phone BLE app).
+
+esphome:
+  name: skyrc-mc3000
+  friendly_name: "SkyRC-MC3000"
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+# Persist changed program settings to flash quickly (default is 1 min, so a
+# reflash/reboot shortly after changing a value would lose it).
+preferences:
+  flash_write_interval: 10s
+
+logger:
+  level: DEBUG
+  logs:
+    esp32_ble: WARN
+    esp32_ble_tracker: WARN
+    ble_client: WARN
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  # Encrypted OTA (ESPHome 2026.9+); empty dict = reuse the api: encryption key.
+  - platform: esphome
+    encryption: {}
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/studiotijn/SkyRC-MC3000-HA-github
+      ref: main
+    components: [mc3000]
+    refresh: 1d
+
+esp32_ble:
+  enable_on_boot: true
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  # BLE address of your charger (see the ESPHome log of a BLE scan)
+  - mac_address: !secret mc3000_mac
+    id: mc3000_client
+    auto_connect: true
+
+mc3000:
+  id: mc3000_hub
+  ble_client_id: mc3000_client
+  update_interval: 5s
+  # Program apply runs channel by channel; per attempt a channel must report
+  # Charging/Discharging/Paused within 15 s of the start command, 3 attempts
+  # (Mc3000Hub::start_timeout_ms_ / max_attempts_, see mc3000.h).
+
+# Last measured charge / discharge capacity per channel, kept across
+# phases (C>D>C) and reboots. Updated by the template sensors below.
+globals:
+  # Quick IR test: discharge current, how long it must hold, overall limit.
+  - id: ir_test_current_ma
+    type: int
+    initial_value: '1000'
+  - id: ir_test_stable_s       # current must hold this long before reading
+    type: int
+    initial_value: '15'
+  - id: ir_test_timeout_s      # hard limit per channel
+    type: int
+    initial_value: '120'
+  # "Storage now": tolerance around the storage voltage, rest before each
+  # re-measure, and the maximum number of charge/discharge corrections.
+  - id: storage_tol_mv
+    type: int
+    initial_value: '20'
+  - id: storage_rest_s
+    type: int
+    initial_value: '120'
+  - id: storage_max_rounds
+    type: int
+    initial_value: '4'
+  - id: st_active
+    type: std::array<bool, 4>
+  - id: st_round
+    type: std::array<int, 4>
+  - id: st_last_mv      # in-band reading from the previous rest (0 = none)
+    type: std::array<int, 4>
+  - id: st_running      # a correction was started this round
+    type: std::array<bool, 4>
+  - id: st_dir          # +1 charging, -1 discharging (this round)
+    type: std::array<int, 4>
+  - id: st_stopping     # ESP-side stop already queued this round
+    type: std::array<bool, 4>
+  - id: st_zero         # consecutive 0 V readings (Standby glitch vs. no cell)
+    type: std::array<int, 4>
+  - id: ir_t0
+    type: std::array<uint32_t, 4>
+  - id: ir_ok_since
+    type: std::array<uint32_t, 4>
+  - id: ir_active       # an IR test is running on this channel
+    type: std::array<bool, 4>
+  # Auto IR test: per slot -1 = unknown (first reading after switching on),
+  # 0 = empty, 1 = cell present; air_cnt counts consecutive readings that
+  # disagree with that state (debounce); air_rr = round-robin channel.
+  - id: air_state
+    type: std::array<int, 4>
+    initial_value: '{-1, -1, -1, -1}'
+  - id: air_cnt
+    type: std::array<int, 4>
+  - id: air_rr
+    type: int
+    initial_value: '0'
+  # Last battery type the per-chemistry defaults were applied for, so the
+  # select's on_value at boot (restore) doesn't overwrite edited values.
+  - id: last_battery_type
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: ch1_store_pending
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch1_storage_phase
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch2_store_pending
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch2_storage_phase
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch3_store_pending
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch3_storage_phase
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch4_store_pending
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch4_storage_phase
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: ch1_chg_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch1_dis_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch2_chg_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch2_dis_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch3_chg_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch3_dis_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch4_chg_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: ch4_dis_cap
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+
+
+# Storage phase for "C>D>Storage": after the C>D capacity test reports Done,
+# charge the cell (CC/CV) to the storage voltage with the same currents.
+script:
+  # Start one quick IR test on channel ch with the shared program settings
+  # (discharge at ir_test_current_ma). Used by the button and by Auto IR Test.
+  - id: ir_test_start
+    mode: parallel
+    parameters:
+      ch: int
+    then:
+      - lambda: |-
+          auto bt_idx = id(program_battery_type).active_index();
+          if (!bt_idx.has_value()) {
+            ESP_LOGW("ir_test", "Battery type not selected, not testing.");
+            return;
+          }
+          if (id(ir_active)[ch - 1]) {
+            ESP_LOGW("ir_test", "Ch%d: IR test already running", ch);
+            return;
+          }
+          mc3000_protocol::ChargeProgram p;
+          p.batteryType = (mc3000_protocol::BatteryType) (*bt_idx);
+          p.mode = mc3000_protocol::ChannelMode::Discharge;
+          p.capacityMah = (uint16_t) id(program_capacity_mah).state;
+          p.chargeCurrentMa = (uint16_t) id(program_charge_current_ma).state;
+          p.dischargeCurrentMa = (uint16_t) id(ir_test_current_ma);
+          p.chargeCutoffMillivolts = (uint16_t) id(program_charge_cutoff_mv).state;
+          p.dischargeCutoffMillivolts = (uint16_t) id(program_discharge_cutoff_mv).state;
+          p.chargeEndCurrentMa = (uint16_t) id(program_charge_end_current_ma).state;
+          p.dischargeEndCurrentMa = (uint16_t) id(program_discharge_end_current_ma).state;
+          p.tempCutoffC = (uint8_t) id(program_temp_cutoff_c).state;
+          p.timeCutoffMinutes = 0;
+          if (ch == 1) id(ch1_store_pending) = false;
+          if (ch == 2) id(ch2_store_pending) = false;
+          if (ch == 3) id(ch3_store_pending) = false;
+          if (ch == 4) id(ch4_store_pending) = false;
+          id(st_active)[ch - 1] = false;  // an IR test takes over: cancel "Storage now"
+          id(ir_active)[ch - 1] = true;
+          // fast: next channel starts ~1.5 s after the previous one; the
+          // hub checks afterwards that every channel really runs.
+          id(mc3000_hub).apply_program(ch, p, true, true);
+          id(ir_test_finish)->execute(ch);
+  # Quick internal-resistance test: the apply queue starts a discharge at
+  # ir_test_current_ma; this waits until the current has held for
+  # ir_test_stable_s, records the reading in "ChN IR Test" and stops the
+  # channel again (also through the queue).
+  - id: ir_test_finish
+    mode: parallel
+    parameters:
+      ch: int
+    then:
+      - lambda: |-
+          id(ir_t0)[ch - 1] = millis();
+          id(ir_ok_since)[ch - 1] = 0;
+          id(ir_active)[ch - 1] = true;
+      # Poll this channel every 2 s. The MC3000 ramps the discharge current up
+      # slowly (~0.5 A after 15 s), so wait until it has held >= 95 % of the
+      # test current for ir_test_stable_s, or give up after ir_test_timeout_s.
+      - while:
+          condition:
+            lambda: |-
+              const uint32_t now = millis();
+              if (now - id(ir_t0)[ch - 1] > (uint32_t) id(ir_test_timeout_s) * 1000) return false;
+              const uint32_t since = id(ir_ok_since)[ch - 1];
+              return !(since != 0 && now - since >= (uint32_t) id(ir_test_stable_s) * 1000);
+          then:
+            - lambda: 'id(mc3000_hub).request_channel(ch);'
+            - delay: 2s
+            - lambda: |-
+                const auto &c = id(mc3000_hub).channel_data(ch);
+                // Compare with the current actually sent (may be capped by the
+                // 15 W discharge budget when several slots test at once).
+                const uint16_t set_ma = id(mc3000_hub).applied_discharge_ma(ch);
+                const float want = (set_ma > 0 ? set_ma : id(ir_test_current_ma)) * 0.95f;
+                const bool at_current = c.status == mc3000_protocol::ChannelStatus::Discharge &&
+                                        c.milliamps >= want;
+                if (!at_current) id(ir_ok_since)[ch - 1] = 0;
+                else if (id(ir_ok_since)[ch - 1] == 0) id(ir_ok_since)[ch - 1] = millis();
+      - lambda: 'id(mc3000_hub).request_channel(ch);'
+      - delay: 2s
+      - lambda: |-
+          const auto &c = id(mc3000_hub).channel_data(ch);
+          const uint32_t since = id(ir_ok_since)[ch - 1];
+          const bool stable = since != 0 && millis() - since >= (uint32_t) id(ir_test_stable_s) * 1000;
+          const float r = c.resistanceMilliohm;
+          sensor::Sensor *out[4] = {id(ch1_ir_test), id(ch2_ir_test), id(ch3_ir_test), id(ch4_ir_test)};
+          if (c.status == mc3000_protocol::ChannelStatus::Discharge && r > 0) {
+            if (stable)
+              ESP_LOGI("ir_test", "Ch%d: %.0f mOhm at %.3f V, %u mA (stable %u s)", ch, r,
+                       c.millivolts / 1000.0f, c.milliamps, (unsigned) id(ir_test_stable_s));
+            else
+              ESP_LOGW("ir_test", "Ch%d: %.0f mOhm, but current never held %u mA (now %u mA)", ch, r,
+                       id(mc3000_hub).applied_discharge_ma(ch), c.milliamps);
+            out[ch - 1]->publish_state(r);
+          } else {
+            ESP_LOGW("ir_test", "Ch%d: no reading (status %s)", ch,
+                     mc3000_protocol::channelStatusName(c.status));
+            out[ch - 1]->publish_state(NAN);
+          }
+      - lambda: |-
+          id(mc3000_hub).queue_stop(ch);
+          id(ir_active)[ch - 1] = false;
+
+  # "Storage now": bring a cell to the storage voltage as fast as the cell's
+  # program currents allow - charge OR discharge, never both - then rest /
+  # re-measure / correct until it holds. The charger does not stop a discharge
+  # at a voltage this high, so the ESP polls the channel every 2 s and stops it
+  # where the cell should relax to the target (terminal voltage +/- I*R).
+  # Stable = inside the band on two consecutive rests that differ by <= 5 mV.
+  - id: storage_now
+    mode: parallel
+    max_runs: 4
+    parameters:
+      ch: int
+    then:
+      - lambda: |-
+          id(st_active)[ch - 1] = true;
+          id(st_round)[ch - 1] = 0;
+          id(st_last_mv)[ch - 1] = 0;
+          id(st_zero)[ch - 1] = 0;
+          // Report automation: treat as storage phase (notification, no report).
+          if (ch == 1) { id(ch1_store_pending) = false; id(ch1_storage_phase) = true; }
+          if (ch == 2) { id(ch2_store_pending) = false; id(ch2_storage_phase) = true; }
+          if (ch == 3) { id(ch3_store_pending) = false; id(ch3_storage_phase) = true; }
+          if (ch == 4) { id(ch4_store_pending) = false; id(ch4_storage_phase) = true; }
+      - while:
+          condition:
+            lambda: 'return id(st_active)[ch - 1];'
+          then:
+            - lambda: 'id(mc3000_hub).request_channel(ch);'
+            - delay: 2s
+            # ---- decide: done / rest again / charge / discharge ----
+            - lambda: |-
+                text_sensor::TextSensor *ts[4] = {id(ch1_storage_status), id(ch2_storage_status),
+                                                  id(ch3_storage_status), id(ch4_storage_status)};
+                const auto &c = id(mc3000_hub).channel_data(ch);
+                const int target = (int) id(program_storage_mv).state;
+                const int v = c.millivolts;
+                const int diff = v - target;
+                char b[80];
+                id(st_running)[ch - 1] = false;
+                id(st_stopping)[ch - 1] = false;
+                if ((uint8_t) c.status >= 128) {
+                  snprintf(b, sizeof(b), "Fout: %s", mc3000_protocol::channelStatusName(c.status));
+                  ts[ch - 1]->publish_state(b);
+                  id(st_active)[ch - 1] = false;
+                  return;
+                }
+                if (v < 1000) {
+                  // The charger sometimes reports 0 V right after a stop.
+                  if (++id(st_zero)[ch - 1] >= 3) {
+                    ts[ch - 1]->publish_state("Geen cel gedetecteerd");
+                    id(st_active)[ch - 1] = false;
+                  }
+                  return;
+                }
+                id(st_zero)[ch - 1] = 0;
+                if (abs(diff) <= id(storage_tol_mv)) {
+                  const int last = id(st_last_mv)[ch - 1];
+                  if (last != 0 && abs(v - last) <= 5) {
+                    snprintf(b, sizeof(b), "Stabiel op %.3f V (doel %.3f V)", v / 1000.0f, target / 1000.0f);
+                    ts[ch - 1]->publish_state(b);
+                    ESP_LOGI("storage_now", "Ch%d: %s", ch, b);
+                    id(st_active)[ch - 1] = false;
+                    return;
+                  }
+                  id(st_last_mv)[ch - 1] = v;
+                  snprintf(b, sizeof(b), "Binnen band %.3f V, controle na rust", v / 1000.0f);
+                  ts[ch - 1]->publish_state(b);
+                  return;
+                }
+                if (id(st_round)[ch - 1] >= id(storage_max_rounds)) {
+                  snprintf(b, sizeof(b), "Niet stabiel na %d rondes (%.3f V)", id(st_round)[ch - 1], v / 1000.0f);
+                  ts[ch - 1]->publish_state(b);
+                  id(st_active)[ch - 1] = false;
+                  return;
+                }
+                id(st_last_mv)[ch - 1] = 0;
+                const int round = ++id(st_round)[ch - 1];
+                auto bt_idx = id(program_battery_type).active_index();
+                mc3000_protocol::ChargeProgram p;
+                p.batteryType = (mc3000_protocol::BatteryType) (bt_idx.has_value() ? *bt_idx : 0);
+                p.capacityMah = (uint16_t) id(program_capacity_mah).state;
+                p.tempCutoffC = (uint8_t) id(program_temp_cutoff_c).state;
+                p.timeCutoffMinutes = (uint16_t) id(program_time_cutoff_min).state;
+                p.chargeEndCurrentMa = (uint16_t) id(program_charge_end_current_ma).state;
+                p.dischargeEndCurrentMa = (uint16_t) id(program_discharge_end_current_ma).state;
+                // Round 1 at the cell's full program current; later rounds are
+                // fine-tuning, so half current (min 100 mA).
+                float chg = id(program_charge_current_ma).state, dis = id(program_discharge_current_ma).state;
+                if (round > 1) { chg = std::max(100.0f, chg / 2); dis = std::max(100.0f, dis / 2); }
+                p.chargeCurrentMa = (uint16_t) chg;
+                p.dischargeCurrentMa = (uint16_t) dis;
+                // Charger cutoffs stay at the normal limits as a safety net;
+                // the ESP stops the channel itself at the storage voltage.
+                p.chargeCutoffMillivolts = (uint16_t) id(program_charge_cutoff_mv).state;
+                p.dischargeCutoffMillivolts = (uint16_t) id(program_discharge_cutoff_mv).state;
+                if (diff > 0) {
+                  p.mode = mc3000_protocol::ChannelMode::Discharge;
+                  id(st_dir)[ch - 1] = -1;
+                } else {
+                  p.mode = mc3000_protocol::ChannelMode::Charge;
+                  p.chargeCutoffMillivolts = (uint16_t) target;  // the charger honours this one (CC/CV)
+                  id(st_dir)[ch - 1] = +1;
+                }
+                id(mc3000_hub).apply_program(ch, p);
+                id(st_running)[ch - 1] = true;
+                snprintf(b, sizeof(b), "%s %.3f -> %.3f V (ronde %d)", diff > 0 ? "Ontladen" : "Laden",
+                         v / 1000.0f, target / 1000.0f, round);
+                ts[ch - 1]->publish_state(b);
+                ESP_LOGI("storage_now", "Ch%d: %s", ch, b);
+            # ---- run the correction, stop it ourselves at the target ----
+            - if:
+                condition:
+                  lambda: 'return id(st_active)[ch - 1] && id(st_running)[ch - 1];'
+                then:
+                  - wait_until:
+                      condition:
+                        lambda: 'return !id(mc3000_hub).apply_busy();'
+                      timeout: 3min
+                  - while:
+                      condition:
+                        lambda: |-
+                          const auto s = id(mc3000_hub).channel_data(ch).status;
+                          const bool running = s == mc3000_protocol::ChannelStatus::Charge ||
+                                               s == mc3000_protocol::ChannelStatus::Discharge ||
+                                               s == mc3000_protocol::ChannelStatus::Pause;
+                          return id(st_active)[ch - 1] && running && !id(st_stopping)[ch - 1];
+                      then:
+                        - lambda: 'id(mc3000_hub).request_channel(ch);'
+                        - delay: 2s
+                        - lambda: |-
+                            const auto &c = id(mc3000_hub).channel_data(ch);
+                            const int target = (int) id(program_storage_mv).state;
+                            const int v = c.millivolts;
+                            if (v < 1000) return;
+                            // Under load the terminal voltage is off by ~I*R; stop where
+                            // the cell should relax to the target.
+                            const float r = c.resistanceMilliohm > 0 ? c.resistanceMilliohm : 50;
+                            const int comp = std::min(150, (int) (c.milliamps / 1000.0f * r));
+                            const bool reached = id(st_dir)[ch - 1] < 0 ? v <= target - comp : v >= target + comp;
+                            if (reached) {
+                              ESP_LOGI("storage_now", "Ch%d: %.3f V under %u mA (comp %d mV) -> stop", ch,
+                                       v / 1000.0f, c.milliamps, comp);
+                              id(st_stopping)[ch - 1] = true;
+                              id(mc3000_hub).queue_stop(ch);
+                            }
+                  - wait_until:
+                      condition:
+                        lambda: |-
+                          const auto s = id(mc3000_hub).channel_data(ch).status;
+                          return s != mc3000_protocol::ChannelStatus::Charge &&
+                                 s != mc3000_protocol::ChannelStatus::Discharge &&
+                                 s != mc3000_protocol::ChannelStatus::Pause;
+                      timeout: 30s
+            - if:
+                condition:
+                  lambda: 'return id(st_active)[ch - 1];'
+                then:
+                  - lambda: |-
+                      text_sensor::TextSensor *ts[4] = {id(ch1_storage_status), id(ch2_storage_status),
+                                                        id(ch3_storage_status), id(ch4_storage_status)};
+                      if (id(st_running)[ch - 1]) ts[ch - 1]->publish_state("Rust, spanning stabiliseert");
+                  - delay: !lambda 'return id(storage_rest_s) * 1000;'
+      - lambda: 'id(st_active)[ch - 1] = false;'
+
+  - id: storage_phase
+    mode: parallel
+    parameters:
+      ch: int
+    then:
+      - delay: 5s
+      - lambda: |-
+          auto bt_idx = id(program_battery_type).active_index();
+          mc3000_protocol::ChargeProgram program;
+          program.batteryType = (mc3000_protocol::BatteryType) (bt_idx.has_value() ? *bt_idx : 0);
+          program.mode = mc3000_protocol::ChannelMode::Charge;
+          program.capacityMah = (uint16_t) id(program_capacity_mah).state;
+          program.chargeCurrentMa = (uint16_t) id(program_charge_current_ma).state;
+          program.dischargeCurrentMa = (uint16_t) id(program_discharge_current_ma).state;
+          program.chargeCutoffMillivolts = (uint16_t) id(program_storage_mv).state;
+          program.dischargeCutoffMillivolts = (uint16_t) id(program_discharge_cutoff_mv).state;
+          program.chargeEndCurrentMa = (uint16_t) id(program_charge_end_current_ma).state;
+          program.tempCutoffC = (uint8_t) id(program_temp_cutoff_c).state;
+          program.timeCutoffMinutes = (uint16_t) id(program_time_cutoff_min).state;
+          ESP_LOGI("storage", "Ch%d: C>D done, charging to storage voltage %.0f mV", ch, id(program_storage_mv).state);
+          if (ch == 1) id(ch1_storage_phase) = true;
+          if (ch == 2) id(ch2_storage_phase) = true;
+          if (ch == 3) id(ch3_storage_phase) = true;
+          if (ch == 4) id(ch4_storage_phase) = true;
+          // Queued like the apply button, so four channels finishing at once
+          // don't fire their commands over each other.
+          id(mc3000_hub).apply_program(ch, program);
+
+binary_sensor:
+  - platform: template
+    name: "Ch1 Storage Phase"
+    icon: "mdi:battery-50"
+    lambda: 'return id(ch1_storage_phase);'
+  - platform: template
+    name: "Ch2 Storage Phase"
+    icon: "mdi:battery-50"
+    lambda: 'return id(ch2_storage_phase);'
+  - platform: template
+    name: "Ch3 Storage Phase"
+    icon: "mdi:battery-50"
+    lambda: 'return id(ch3_storage_phase);'
+  - platform: template
+    name: "Ch4 Storage Phase"
+    icon: "mdi:battery-50"
+    lambda: 'return id(ch4_storage_phase);'
+  - platform: ble_presence
+    mac_address: !secret mc3000_mac
+    name: "Advertising"
+
+sensor:
+  # Result of the quick IR test per channel (button "Program: IR Test ...").
+  - platform: template
+    id: ch1_ir_test
+    name: "Ch1 IR Test"
+    unit_of_measurement: "mΩ"
+    icon: "mdi:omega"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: ch2_ir_test
+    name: "Ch2 IR Test"
+    unit_of_measurement: "mΩ"
+    icon: "mdi:omega"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: ch3_ir_test
+    name: "Ch3 IR Test"
+    unit_of_measurement: "mΩ"
+    icon: "mdi:omega"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: ch4_ir_test
+    name: "Ch4 IR Test"
+    unit_of_measurement: "mΩ"
+    icon: "mdi:omega"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 1
+    voltage:
+      name: "Ch1 Voltage"
+    current:
+      name: "Ch1 Current"
+    capacity:
+      name: "Ch1 Capacity"
+    temperature:
+      name: "Ch1 Temperature"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x >= id(safety_max_temp_c).state;'
+            then:
+              - logger.log:
+                  level: WARN
+                  format: "Ch1 at %.0f°C >= safety limit, stopping charge"
+                  args: ['x']
+              - lambda: 'id(mc3000_hub).stop_charge(1);'
+    resistance:
+      name: "Ch1 Resistance"
+
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 2
+    voltage:
+      name: "Ch2 Voltage"
+    current:
+      name: "Ch2 Current"
+    capacity:
+      name: "Ch2 Capacity"
+    temperature:
+      name: "Ch2 Temperature"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x >= id(safety_max_temp_c).state;'
+            then:
+              - logger.log:
+                  level: WARN
+                  format: "Ch2 at %.0f°C >= safety limit, stopping charge"
+                  args: ['x']
+              - lambda: 'id(mc3000_hub).stop_charge(2);'
+    resistance:
+      name: "Ch2 Resistance"
+
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 3
+    voltage:
+      name: "Ch3 Voltage"
+    current:
+      name: "Ch3 Current"
+    capacity:
+      name: "Ch3 Capacity"
+    temperature:
+      name: "Ch3 Temperature"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x >= id(safety_max_temp_c).state;'
+            then:
+              - logger.log:
+                  level: WARN
+                  format: "Ch3 at %.0f°C >= safety limit, stopping charge"
+                  args: ['x']
+              - lambda: 'id(mc3000_hub).stop_charge(3);'
+    resistance:
+      name: "Ch3 Resistance"
+
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 4
+    voltage:
+      name: "Ch4 Voltage"
+    current:
+      name: "Ch4 Current"
+    capacity:
+      name: "Ch4 Capacity"
+    temperature:
+      name: "Ch4 Temperature"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x >= id(safety_max_temp_c).state;'
+            then:
+              - logger.log:
+                  level: WARN
+                  format: "Ch4 at %.0f°C >= safety limit, stopping charge"
+                  args: ['x']
+              - lambda: 'id(mc3000_hub).stop_charge(4);'
+    resistance:
+      name: "Ch4 Resistance"
+
+  # --- Extra per-channel values from the 0x55 channel-data reply ---
+  - platform: template
+    name: "Ch1 Elapsed Time"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(1)) return {};
+      return (float) id(mc3000_hub).channel_data(1).elapsedSeconds;
+  - platform: template
+    name: "Ch1 Cycle"
+    icon: "mdi:sync"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(1)) return {};
+      return (float) id(mc3000_hub).channel_data(1).cycleCount;
+  - platform: template
+    name: "Ch2 Elapsed Time"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(2)) return {};
+      return (float) id(mc3000_hub).channel_data(2).elapsedSeconds;
+  - platform: template
+    name: "Ch2 Cycle"
+    icon: "mdi:sync"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(2)) return {};
+      return (float) id(mc3000_hub).channel_data(2).cycleCount;
+  - platform: template
+    name: "Ch3 Elapsed Time"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(3)) return {};
+      return (float) id(mc3000_hub).channel_data(3).elapsedSeconds;
+  - platform: template
+    name: "Ch3 Cycle"
+    icon: "mdi:sync"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(3)) return {};
+      return (float) id(mc3000_hub).channel_data(3).cycleCount;
+  - platform: template
+    name: "Ch4 Elapsed Time"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(4)) return {};
+      return (float) id(mc3000_hub).channel_data(4).elapsedSeconds;
+  - platform: template
+    name: "Ch4 Cycle"
+    icon: "mdi:sync"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(4)) return {};
+      return (float) id(mc3000_hub).channel_data(4).cycleCount;
+
+  # --- Charge / discharge capacity per phase ---
+  # The charger's own capacity counter restarts every phase. These hold the
+  # last value reached in a Charge resp. Discharge phase, so after a C>D>C
+  # cycle you can read the measured discharge capacity.
+  - platform: template
+    name: "Ch1 Charged Capacity"
+    icon: "mdi:battery-arrow-up"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(1)) {
+        const auto &c = id(mc3000_hub).channel_data(1);
+        if (c.status == mc3000_protocol::ChannelStatus::Charge) id(ch1_chg_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch1_chg_cap))) return {};
+      return id(ch1_chg_cap);
+  - platform: template
+    name: "Ch1 Discharged Capacity"
+    icon: "mdi:battery-arrow-down"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(1)) {
+        const auto &c = id(mc3000_hub).channel_data(1);
+        if (c.status == mc3000_protocol::ChannelStatus::Discharge) id(ch1_dis_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch1_dis_cap))) return {};
+      return id(ch1_dis_cap);
+  - platform: template
+    name: "Ch2 Charged Capacity"
+    icon: "mdi:battery-arrow-up"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(2)) {
+        const auto &c = id(mc3000_hub).channel_data(2);
+        if (c.status == mc3000_protocol::ChannelStatus::Charge) id(ch2_chg_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch2_chg_cap))) return {};
+      return id(ch2_chg_cap);
+  - platform: template
+    name: "Ch2 Discharged Capacity"
+    icon: "mdi:battery-arrow-down"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(2)) {
+        const auto &c = id(mc3000_hub).channel_data(2);
+        if (c.status == mc3000_protocol::ChannelStatus::Discharge) id(ch2_dis_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch2_dis_cap))) return {};
+      return id(ch2_dis_cap);
+  - platform: template
+    name: "Ch3 Charged Capacity"
+    icon: "mdi:battery-arrow-up"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(3)) {
+        const auto &c = id(mc3000_hub).channel_data(3);
+        if (c.status == mc3000_protocol::ChannelStatus::Charge) id(ch3_chg_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch3_chg_cap))) return {};
+      return id(ch3_chg_cap);
+  - platform: template
+    name: "Ch3 Discharged Capacity"
+    icon: "mdi:battery-arrow-down"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(3)) {
+        const auto &c = id(mc3000_hub).channel_data(3);
+        if (c.status == mc3000_protocol::ChannelStatus::Discharge) id(ch3_dis_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch3_dis_cap))) return {};
+      return id(ch3_dis_cap);
+  - platform: template
+    name: "Ch4 Charged Capacity"
+    icon: "mdi:battery-arrow-up"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(4)) {
+        const auto &c = id(mc3000_hub).channel_data(4);
+        if (c.status == mc3000_protocol::ChannelStatus::Charge) id(ch4_chg_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch4_chg_cap))) return {};
+      return id(ch4_chg_cap);
+  - platform: template
+    name: "Ch4 Discharged Capacity"
+    icon: "mdi:battery-arrow-down"
+    unit_of_measurement: "mAh"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (id(mc3000_hub).has_channel_data(4)) {
+        const auto &c = id(mc3000_hub).channel_data(4);
+        if (c.status == mc3000_protocol::ChannelStatus::Discharge) id(ch4_dis_cap) = c.capacityMah;
+      }
+      if (std::isnan(id(ch4_dis_cap))) return {};
+      return id(ch4_dis_cap);
+
+  # --- Charger-wide values from the 0x61 basic-data reply ---
+  - platform: template
+    name: "Input Voltage"
+    icon: "mdi:power-plug"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: |-
+      if (!id(mc3000_hub).has_basic_data()) return {};
+      return id(mc3000_hub).basic_data().inputMillivolts / 1000.0f;
+
+text_sensor:
+  # Progress / outcome of "Storage now" per channel.
+  - platform: template
+    id: ch1_storage_status
+    name: "Ch1 Storage Status"
+    icon: "mdi:battery-50"
+  - platform: template
+    id: ch2_storage_status
+    name: "Ch2 Storage Status"
+    icon: "mdi:battery-50"
+  - platform: template
+    id: ch3_storage_status
+    name: "Ch3 Storage Status"
+    icon: "mdi:battery-50"
+  - platform: template
+    id: ch4_storage_status
+    name: "Ch4 Storage Status"
+    icon: "mdi:battery-50"
+  # Outcome of the last program apply per channel, e.g. "Ch3: gestart in 6.2 s
+  # (poging 1)" or "Ch2: NIET gestart na 3 pogingen (status Standby)".
+  - platform: template
+    name: "Program: Apply Result"
+    icon: "mdi:clipboard-check-outline"
+    update_interval: 1s
+    lambda: |-
+      static std::string last;
+      const auto &r = id(mc3000_hub).apply_result();
+      if (r.empty() || r == last) return {};
+      last = r;
+      return r;
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 1
+    status:
+      name: "Ch1 Status"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x == "Done" && id(ch1_store_pending);'
+            then:
+              - lambda: 'id(ch1_store_pending) = false;'
+              - script.execute:
+                  id: storage_phase
+                  ch: 1
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 2
+    status:
+      name: "Ch2 Status"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x == "Done" && id(ch2_store_pending);'
+            then:
+              - lambda: 'id(ch2_store_pending) = false;'
+              - script.execute:
+                  id: storage_phase
+                  ch: 2
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 3
+    status:
+      name: "Ch3 Status"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x == "Done" && id(ch3_store_pending);'
+            then:
+              - lambda: 'id(ch3_store_pending) = false;'
+              - script.execute:
+                  id: storage_phase
+                  ch: 3
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 4
+    status:
+      name: "Ch4 Status"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x == "Done" && id(ch4_store_pending);'
+            then:
+              - lambda: 'id(ch4_store_pending) = false;'
+              - script.execute:
+                  id: storage_phase
+                  ch: 4
+
+  # --- Active program as reported back by the charger (0x55) ---
+  - platform: template
+    name: "Ch1 Battery Type"
+    icon: "mdi:battery-unknown"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(1)) return {};
+      return std::string(mc3000_protocol::batteryTypeName(id(mc3000_hub).channel_data(1).batteryType));
+  - platform: template
+    name: "Ch1 Mode"
+    icon: "mdi:cog-outline"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(1)) return {};
+      return std::string(mc3000_protocol::channelModeName(id(mc3000_hub).channel_data(1).mode));
+  - platform: template
+    name: "Ch1 LED"
+    icon: "mdi:led-on"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(1)) return {};
+      const auto &c = id(mc3000_hub).channel_data(1);
+      const bool r = c.isRedLed(0), g = c.isGreenLed(0);
+      return std::string(r && g ? "Red+Green" : r ? "Red" : g ? "Green" : "Off");
+  - platform: template
+    name: "Ch2 Battery Type"
+    icon: "mdi:battery-unknown"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(2)) return {};
+      return std::string(mc3000_protocol::batteryTypeName(id(mc3000_hub).channel_data(2).batteryType));
+  - platform: template
+    name: "Ch2 Mode"
+    icon: "mdi:cog-outline"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(2)) return {};
+      return std::string(mc3000_protocol::channelModeName(id(mc3000_hub).channel_data(2).mode));
+  - platform: template
+    name: "Ch2 LED"
+    icon: "mdi:led-on"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(2)) return {};
+      const auto &c = id(mc3000_hub).channel_data(2);
+      const bool r = c.isRedLed(1), g = c.isGreenLed(1);
+      return std::string(r && g ? "Red+Green" : r ? "Red" : g ? "Green" : "Off");
+  - platform: template
+    name: "Ch3 Battery Type"
+    icon: "mdi:battery-unknown"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(3)) return {};
+      return std::string(mc3000_protocol::batteryTypeName(id(mc3000_hub).channel_data(3).batteryType));
+  - platform: template
+    name: "Ch3 Mode"
+    icon: "mdi:cog-outline"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(3)) return {};
+      return std::string(mc3000_protocol::channelModeName(id(mc3000_hub).channel_data(3).mode));
+  - platform: template
+    name: "Ch3 LED"
+    icon: "mdi:led-on"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(3)) return {};
+      const auto &c = id(mc3000_hub).channel_data(3);
+      const bool r = c.isRedLed(2), g = c.isGreenLed(2);
+      return std::string(r && g ? "Red+Green" : r ? "Red" : g ? "Green" : "Off");
+  - platform: template
+    name: "Ch4 Battery Type"
+    icon: "mdi:battery-unknown"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(4)) return {};
+      return std::string(mc3000_protocol::batteryTypeName(id(mc3000_hub).channel_data(4).batteryType));
+  - platform: template
+    name: "Ch4 Mode"
+    icon: "mdi:cog-outline"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(4)) return {};
+      return std::string(mc3000_protocol::channelModeName(id(mc3000_hub).channel_data(4).mode));
+  - platform: template
+    name: "Ch4 LED"
+    icon: "mdi:led-on"
+    update_interval: 5s
+    lambda: |-
+      if (!id(mc3000_hub).has_channel_data(4)) return {};
+      const auto &c = id(mc3000_hub).channel_data(4);
+      const bool r = c.isRedLed(3), g = c.isGreenLed(3);
+      return std::string(r && g ? "Red+Green" : r ? "Red" : g ? "Green" : "Off");
+
+  # --- Charger-wide info (0x61 basic data, 0x57 version) ---
+  - platform: template
+    name: "Cooling Fan"
+    icon: "mdi:fan"
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (!id(mc3000_hub).has_basic_data()) return {};
+      const uint8_t m = id(mc3000_hub).basic_data().coolingFanMode;
+      if (m == 0) return std::string("Auto");
+      if (m == 1) return std::string("Off");
+      if (m == 2) return std::string("On");
+      if (m <= 9) return std::string("From ") + to_string(20 + (m - 3) * 5) + " °C";
+      return std::string("Unknown (") + to_string(m) + ")";
+  - platform: template
+    name: "Charger Settings"
+    icon: "mdi:cog"
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (!id(mc3000_hub).has_basic_data()) return {};
+      const auto &b = id(mc3000_hub).basic_data();
+      static const char *const kDisplayModes[] = {"Off", "Auto", "1 min", "3 min", "5 min", "Always on"};
+      std::string disp = b.displayMode <= 5 ? kDisplayModes[b.displayMode] : "?";
+      return std::string("Unit: ") + (b.fahrenheit ? "°F" : "°C") +
+             ", Beep: " + (b.beep ? "on" : "off") +
+             ", Display: " + disp +
+             ", Screensaver: " + (b.screensaver ? "on" : "off");
+  - platform: template
+    name: "Charger Firmware"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      if (!id(mc3000_hub).has_version_info()) return {};
+      const auto &v = id(mc3000_hub).version_info();
+      char buf[32];
+      snprintf(buf, sizeof(buf), "FW %u.%02u / HW %u.%u", v.fwMajor, v.fwMinor, v.hwVersionRaw / 10, v.hwVersionRaw % 10);
+      return std::string(buf);
+
+interval:
+  # Auto IR test: one slot per tick, so every slot is read every 1.6 s and a
+  # quick cell swap (a few seconds out of the slot) is still seen.
+  - interval: 400ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(auto_ir_test).state && id(mc3000_hub).is_connected() && !id(mc3000_hub).apply_busy();'
+          then:
+            - lambda: |-
+                // Evaluate the slot requested on the previous tick (its reply is in).
+                const int ch = id(air_rr) + 1;
+                if (id(mc3000_hub).has_channel_data(ch)) {
+                  const auto &c = id(mc3000_hub).channel_data(ch);
+                  const int i = ch - 1;
+                  const bool idle = c.status == mc3000_protocol::ChannelStatus::Standby ||
+                                    c.status == mc3000_protocol::ChannelStatus::Done;
+                  int seen = c.millivolts >= 2000 ? 1 : (c.millivolts < 1000 ? 0 : -2);
+                  // A 0 V reading while a test/storage run is busy is a transition glitch.
+                  if (seen == 0 && (!idle || id(ir_active)[i] || id(st_active)[i])) seen = -2;
+                  if (seen >= 0) {
+                    if (id(air_state)[i] == -1) {
+                      id(air_state)[i] = seen;          // first reading: just record
+                      id(air_cnt)[i] = 0;
+                    } else if (seen == id(air_state)[i]) {
+                      id(air_cnt)[i] = 0;
+                    } else if (++id(air_cnt)[i] >= (seen == 1 ? 2 : 1)) {  // out: 1 reading, in: 2 (~1.6 s, contact bounce)
+                      id(air_state)[i] = seen;
+                      id(air_cnt)[i] = 0;
+                      if (seen == 1) {
+                        const bool sel[4] = {id(program_target_ch1).state, id(program_target_ch2).state,
+                                             id(program_target_ch3).state, id(program_target_ch4).state};
+                        if (!sel[i]) {
+                          ESP_LOGI("auto_ir", "Ch%d: new cell (%u mV), channel not selected", ch, c.millivolts);
+                        } else if (!idle || id(st_active)[i] || id(ir_active)[i]) {
+                          ESP_LOGI("auto_ir", "Ch%d: new cell, but channel busy - no test", ch);
+                        } else {
+                          ESP_LOGI("auto_ir", "Ch%d: new cell (%u mV) -> IR test", ch, c.millivolts);
+                          id(ir_test_start)->execute(ch);
+                        }
+                      } else {
+                        ESP_LOGI("auto_ir", "Ch%d: cell removed", ch);
+                      }
+                    }
+                  }
+                }
+                id(air_rr) = (id(air_rr) + 1) % 4;
+                id(mc3000_hub).request_channel(id(air_rr) + 1);
+
+switch:
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 1
+    name: "Ch1 Charging"
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 2
+    name: "Ch2 Charging"
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 3
+    name: "Ch3 Charging"
+  - platform: mc3000
+    mc3000_id: mc3000_hub
+    channel: 4
+    name: "Ch4 Charging"
+
+  # "Apply to Channel N" targets for the shared program below - tick
+  # whichever channels you want the same battery type/currents/cutoffs
+  # pushed to, then press "Apply Program". These are just plain UI state
+  # (optimistic template switches), not reflecting anything from the
+  # charger itself.
+  - platform: template
+    id: program_target_ch1
+    name: "Program: Apply to Channel 1"
+    icon: "mdi:numeric-1-box-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: program_target_ch2
+    name: "Program: Apply to Channel 2"
+    icon: "mdi:numeric-2-box-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: program_target_ch3
+    name: "Program: Apply to Channel 3"
+    icon: "mdi:numeric-3-box-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: program_target_ch4
+    name: "Program: Apply to Channel 4"
+    icon: "mdi:numeric-4-box-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # Auto IR test: on the channels ticked under "Apply to Channel N", start a
+  # quick IR test whenever a new cell is inserted into an idle slot. Cells
+  # already in a slot when this is switched on are left alone.
+  - platform: template
+    id: auto_ir_test
+    name: "Program: Auto IR Test"
+    icon: "mdi:omega"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: |-
+          for (int i = 0; i < 4; i++) { id(air_state)[i] = -1; id(air_cnt)[i] = 0; }
+
+# Shared charge-program controls: set these once, tick whichever "Apply to
+# Channel N" switches above you want it sent to, then press the button -
+# this is for "run the exact same test on 2/3/4 channels at once" instead
+# of configuring each channel separately. Order of `options:` below must
+# match mc3000_protocol::BatteryType / ChannelMode's enum order exactly -
+# the button's lambda casts the selected *index*, not the text, to the enum.
+select:
+  - platform: template
+    id: program_battery_type
+    name: "Program: Battery Type"
+    icon: "mdi:battery-unknown"
+    optimistic: true
+    restore_value: true
+    initial_option: LiIon
+    # Per-chemistry defaults taken from the official app (com.Sky_mc3000
+    # 4.1.2, tools/Constant.java + AddActivity.initBatteryInfo): charge
+    # cutoff, discharge cutoff, restart ("keep") voltage, storage voltage.
+    # Applied only when the type actually changes, not on boot/restore.
+    on_value:
+      - lambda: |-
+          auto sel = id(program_battery_type).active_index();
+          if (!sel.has_value() || (int) *sel == id(last_battery_type)) return;
+          const bool first = id(last_battery_type) < 0;
+          id(last_battery_type) = (int) *sel;
+          if (first) return;  // very first boot: keep YAML initial values
+          //                           LiIon LiFe  4.35  NiMH  NiCd  NiZn  Enel  RAM   LTO
+          static const float CHG[]  = {4200, 3600, 4350, 1650, 1650, 1900, 1650, 1650, 2850};
+          static const float DIS[]  = {3000, 2900, 3300, 1000, 1000, 1200,  900,  900, 1800};
+          static const float KEEP[] = {4150, 3550, 4250, 1350, 1350, 1600, 1350, 1450, 2700};
+          static const float STOR[] = {3800, 3300, 3900,    0,    0,    0,    0,    0, 2400};
+          const size_t t = *sel;
+          if (t >= 9) return;
+          auto set = [](number::Number *n, float v) { auto c = n->make_call(); c.set_value(v); c.perform(); };
+          set(id(program_charge_cutoff_mv), CHG[t]);
+          set(id(program_discharge_cutoff_mv), DIS[t]);
+          set(id(program_keep_voltage_mv), KEEP[t]);
+          if (STOR[t] > 0) set(id(program_storage_mv), STOR[t]);
+          ESP_LOGI("presets", "Battery type #%u: defaults %.0f/%.0f/%.0f mV applied",
+                   (unsigned) t, CHG[t], DIS[t], KEEP[t]);
+    options:
+      - LiIon
+      - LiFe
+      - "LiIon 4.35V"
+      - NiMH
+      - NiCd
+      - NiZn
+      - Eneloop
+      - RAM
+      - LTO
+  - platform: template
+    id: program_mode
+    name: "Program: Mode"
+    icon: "mdi:cog-outline"
+    optimistic: true
+    restore_value: true
+    initial_option: Charge
+    options:
+      - Charge
+      - Refresh
+      - "Storage/Break-in"
+      - Discharge
+      - Cycle
+      # Not a charger mode: runs Cycle C>D (capacity test), then on Done
+      # automatically charges to "Program: Storage Voltage" (see script
+      # storage_phase). Must stay LAST - indices 0-4 map 1:1 to the protocol.
+      - "C>D>Storage"
+  # Only used when Mode = Cycle. Order must match the protocol byte
+  # (0 C>D, 1 C>D>C, 2 D>C, 3 D>C>D).
+  - platform: template
+    id: program_cycle_mode
+    name: "Program: Cycle Mode"
+    icon: "mdi:sync"
+    optimistic: true
+    restore_value: true
+    initial_option: "C>D>C"
+    options:
+      - "C>D"
+      - "C>D>C"
+      - "D>C"
+      - "D>C>D"
+
+number:
+  - platform: template
+    id: program_capacity_mah
+    name: "Program: Capacity"
+    icon: "mdi:battery-charging-high"
+    unit_of_measurement: "mAh"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 20000
+    step: 100
+    initial_value: 2000
+  - platform: template
+    id: program_charge_current_ma
+    name: "Program: Charge Current"
+    unit_of_measurement: "mA"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 5000
+    step: 50
+    initial_value: 500
+  - platform: template
+    id: program_discharge_current_ma
+    name: "Program: Discharge Current"
+    unit_of_measurement: "mA"
+    mode: box
+    optimistic: true
+    restore_value: true
+    # MC3000 discharge range per slot; the hub additionally caps the total
+    # discharge power at 15 W across all slots (see limit_discharge_()).
+    min_value: 50
+    max_value: 2000
+    step: 10
+    initial_value: 500
+  - platform: template
+    id: program_charge_cutoff_mv
+    name: "Program: Charge Cutoff Voltage"
+    unit_of_measurement: "mV"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 5000
+    step: 10
+    initial_value: 4200
+  - platform: template
+    id: program_discharge_cutoff_mv
+    name: "Program: Discharge Cutoff Voltage"
+    unit_of_measurement: "mV"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 5000
+    step: 10
+    initial_value: 3000
+  - platform: template
+    id: program_charge_end_current_ma
+    name: "Program: Charge End Current"
+    unit_of_measurement: "mA"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 2000
+    step: 10
+    initial_value: 50
+  - platform: template
+    id: program_cycle_count
+    name: "Program: Cycle Count"
+    icon: "mdi:counter"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 99
+    step: 1
+    initial_value: 1
+  - platform: template
+    id: program_rest_min
+    name: "Program: Rest Time"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "min"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 60
+    step: 1
+    initial_value: 10
+  - platform: template
+    id: program_discharge_end_current_ma
+    name: "Program: Discharge End Current"
+    icon: "mdi:arrow-collapse-down"
+    unit_of_measurement: "mA"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 2000
+    step: 10
+    initial_value: 0
+  - platform: template
+    id: program_time_cutoff_min
+    name: "Program: Time Cutoff"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "min"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 1440
+    step: 10
+    initial_value: 0
+  - platform: template
+    id: program_keep_voltage_mv
+    name: "Program: Restart Voltage"
+    icon: "mdi:battery-arrow-up-outline"
+    unit_of_measurement: "mV"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 5000
+    step: 10
+    initial_value: 0
+  # NiMH / NiCd / Eneloop only - sent as 0 for every other battery type.
+  - platform: template
+    id: program_neg_delta_v_mv
+    name: "Program: -dV (Ni only)"
+    icon: "mdi:chart-bell-curve"
+    unit_of_measurement: "mV"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 20
+    step: 1
+    initial_value: 3
+  - platform: template
+    id: program_trickle_current_ma
+    name: "Program: Trickle Current (Ni only)"
+    icon: "mdi:water-outline"
+    unit_of_measurement: "mA"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 10
+    initial_value: 0
+  - platform: template
+    id: program_storage_mv
+    name: "Program: Storage Voltage"
+    icon: "mdi:battery-50"
+    unit_of_measurement: "mV"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 2000
+    max_value: 4000
+    step: 10
+    initial_value: 3800
+  # Sent to the charger as its own per-program temperature cutoff (byte 26).
+  # Was never set before -> charger got 0. Li-ion: keep at 45 °C.
+  - platform: template
+    id: program_temp_cutoff_c
+    name: "Program: Temperature Cutoff"
+    icon: "mdi:thermometer-alert"
+    unit_of_measurement: "°C"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 20
+    max_value: 60
+    step: 1
+    initial_value: 45
+  # Independent ESP-side failsafe: if any channel reaches this temperature
+  # while charging, the ESP stops that channel itself - regardless of what
+  # program the charger is running (also programs set on the charger/app).
+  - platform: template
+    id: safety_max_temp_c
+    name: "Safety: Max Channel Temperature"
+    icon: "mdi:fire-alert"
+    entity_category: config
+    unit_of_measurement: "°C"
+    mode: box
+    optimistic: true
+    restore_value: true
+    min_value: 30
+    max_value: 60
+    step: 1
+    initial_value: 47
+
+button:
+  - platform: template
+    name: "Program: Storage Now Selected Channels"
+    icon: "mdi:battery-50"
+    on_press:
+      - lambda: |-
+          auto bt_idx = id(program_battery_type).active_index();
+          const auto bt = (mc3000_protocol::BatteryType) (bt_idx.has_value() ? *bt_idx : 0);
+          if (bt == mc3000_protocol::BatteryType::NiMH || bt == mc3000_protocol::BatteryType::NiCd ||
+              bt == mc3000_protocol::BatteryType::Eneloop) {
+            ESP_LOGW("storage_now", "Storage voltage is for Li chemistries, not %u", (unsigned) bt);
+            return;
+          }
+          const bool sel[4] = {id(program_target_ch1).state, id(program_target_ch2).state,
+                               id(program_target_ch3).state, id(program_target_ch4).state};
+          for (int ch = 1; ch <= 4; ch++) {
+            if (!sel[ch - 1]) continue;
+            if (id(st_active)[ch - 1]) {
+              ESP_LOGW("storage_now", "Ch%d already busy", ch);
+              continue;
+            }
+            id(storage_now)->execute(ch);
+          }
+  - platform: template
+    name: "Program: IR Test Selected Channels"
+    icon: "mdi:omega"
+    on_press:
+      - lambda: |-
+          const bool sel[4] = {id(program_target_ch1).state, id(program_target_ch2).state,
+                               id(program_target_ch3).state, id(program_target_ch4).state};
+          for (int ch = 1; ch <= 4; ch++)
+            if (sel[ch - 1]) id(ir_test_start)->execute(ch);
+  - platform: template
+    name: "Program: Apply to Selected Channels"
+    icon: "mdi:battery-sync-outline"
+    on_press:
+      # Build the program once, then queue it per selected channel. The hub
+      # applies the queue one channel at a time (stop -> program -> read-back
+      # -> start -> verify started, with retries); see mc3000.h apply_program().
+      - lambda: |-
+          auto bt_idx = id(program_battery_type).active_index();
+          auto mode_idx = id(program_mode).active_index();
+          if (!bt_idx.has_value() || !mode_idx.has_value()) {
+            ESP_LOGW("program_apply", "Battery type / mode not selected, not applying.");
+            return;
+          }
+
+          mc3000_protocol::ChargeProgram program;
+          program.batteryType = (mc3000_protocol::BatteryType) (*bt_idx);
+          const bool store_after = (*mode_idx == 5);  // "C>D>Storage"
+          program.mode = store_after ? mc3000_protocol::ChannelMode::Cycle
+                                     : (mc3000_protocol::ChannelMode) (*mode_idx);
+          program.capacityMah = (uint16_t) id(program_capacity_mah).state;
+          program.chargeCurrentMa = (uint16_t) id(program_charge_current_ma).state;
+          program.dischargeCurrentMa = (uint16_t) id(program_discharge_current_ma).state;
+          program.chargeCutoffMillivolts = (uint16_t) id(program_charge_cutoff_mv).state;
+          program.dischargeCutoffMillivolts = (uint16_t) id(program_discharge_cutoff_mv).state;
+          program.chargeEndCurrentMa = (uint16_t) id(program_charge_end_current_ma).state;
+          program.tempCutoffC = (uint8_t) id(program_temp_cutoff_c).state;
+          auto cyc_idx = id(program_cycle_mode).active_index();
+          program.cycleMode = cyc_idx.has_value() ? (uint8_t) *cyc_idx : 1;
+          program.cycleCount = (uint8_t) id(program_cycle_count).state;
+          if (store_after) {
+            program.cycleMode = 0;   // C>D
+            program.cycleCount = 1;
+          }
+          // Arm (or disarm) the automatic storage phase per targeted channel;
+          // a new program also cancels a running "Storage now" on that channel.
+          if (id(program_target_ch1).state) { id(ch1_store_pending) = store_after; id(ch1_storage_phase) = false; id(st_active)[0] = false; }
+          if (id(program_target_ch2).state) { id(ch2_store_pending) = store_after; id(ch2_storage_phase) = false; id(st_active)[1] = false; }
+          if (id(program_target_ch3).state) { id(ch3_store_pending) = store_after; id(ch3_storage_phase) = false; id(st_active)[2] = false; }
+          if (id(program_target_ch4).state) { id(ch4_store_pending) = store_after; id(ch4_storage_phase) = false; id(st_active)[3] = false; }
+          program.chargeRestMinutes = (uint8_t) id(program_rest_min).state;
+          program.dischargeRestMinutes = (uint8_t) id(program_rest_min).state;
+          program.dischargeEndCurrentMa = (uint16_t) id(program_discharge_end_current_ma).state;
+          program.timeCutoffMinutes = (uint16_t) id(program_time_cutoff_min).state;
+          program.keepVoltageMillivolts = (uint16_t) id(program_keep_voltage_mv).state;
+          const bool is_ni = program.batteryType == mc3000_protocol::BatteryType::NiMH ||
+                             program.batteryType == mc3000_protocol::BatteryType::NiCd ||
+                             program.batteryType == mc3000_protocol::BatteryType::Eneloop;
+          program.negativeVoltageIncrementMv = is_ni ? (uint8_t) id(program_neg_delta_v_mv).state : 0;
+          program.eddyCurrentTimesTen = is_ni ? (uint8_t) (id(program_trickle_current_ma).state / 10) : 0;
+          // Charger's own Storage mode (Li chemistries; for Ni it is Break-in):
+          // the target voltage travels in the charge-cutoff field, so send the
+          // Storage Voltage setting there instead of the full-charge voltage.
+          if (*mode_idx == 2 && !is_ni) {
+            program.chargeCutoffMillivolts = (uint16_t) id(program_storage_mv).state;
+            ESP_LOGI("program_apply", "Storage mode: target %.0f mV", id(program_storage_mv).state);
+          }
+
+          // The charger does not start by itself after a new program (the
+          // official app also sends startCharge after the ack); apply_program
+          // sends the start and checks it took. A channel above the safety
+          // limit is stopped again by the temperature on_value failsafe.
+          if (id(program_target_ch1).state) id(mc3000_hub).apply_program(1, program);
+          if (id(program_target_ch2).state) id(mc3000_hub).apply_program(2, program);
+          if (id(program_target_ch3).state) id(mc3000_hub).apply_program(3, program);
+          if (id(program_target_ch4).state) id(mc3000_hub).apply_program(4, program);

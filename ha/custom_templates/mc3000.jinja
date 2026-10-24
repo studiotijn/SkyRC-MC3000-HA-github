@@ -1,0 +1,43 @@
+{#- SkyRC MC3000: charger program for one cell of the dashboard's cell database
+    (sensor.mc3000_cellen). Same rules as the dashboard card (mc3000-card.js,
+    PROGRAMS / params()), keep both in step:
+      charge     = min(datasheet standard charge, 0.5C, 2 A), 50 mA steps
+      discharge  = 0.2C (IEC 61960 capacity test), 50 mA steps, 0.1-2.0 A
+      end current = C/20 (min 50 mA), discharge end current = discharge current
+      capacity limit = 1.25 x rated (safety stop, not the cell capacity)
+      time limit = 1.5 x the expected phase time + 1 h (max 24 h)
+    `factor` (0.5-1) lowers both currents, used after a temperature fault. -#}
+{% macro mc3000_params(cell_id, mode, factor=1) -%}
+{%- set db = states.sensor.mc3000_cellen.attributes if states.sensor.mc3000_cellen is not none else {} -%}
+{%- set c = (db.get('cells') or {}).get(cell_id) -%}
+{%- set t = (db.get('types') or {}).get(c.type) if c else none -%}
+{%- if not t -%}
+{{ {'ok': false} | to_json }}
+{%- else -%}
+{%- set chem = t.chem | default('LiIon', true) -%}
+{%- set vmax_def = {'LiIon': 4200, 'LiFe': 3600, 'LiIon 4.35V': 4350, 'LTO': 2850, 'NiMH': 1650, 'NiCd': 1650, 'Eneloop': 1650, 'NiZn': 1900, 'RAM': 1650} -%}
+{%- set vcut_def = {'LiIon': 2500, 'LiFe': 2500, 'LiIon 4.35V': 3000, 'LTO': 1800, 'NiMH': 1000, 'NiCd': 1000, 'Eneloop': 1000, 'NiZn': 1200, 'RAM': 900} -%}
+{%- set vsto_def = {'LiIon': 3700, 'LiFe': 3300, 'LiIon 4.35V': 3800, 'LTO': 2400} -%}
+{%- set f = [[factor | float(1), 0.5] | max, 1] | min -%}
+{%- set cap = t.cap | int(2000) -%}
+{%- set std = t.chg_std | int(0) -%}
+{%- set chg = [((([std if std > 0 else cap * 0.5, cap * 0.5, 2000] | min) * f / 50) | round(0) | int) * 50, 100] | max -%}
+{%- set dis = [[((cap * 0.2 * f / 50) | round(0) | int) * 50, 100] | max, 2000] | min -%}
+{%- set endc = [((cap / 20 / 10) | round(0) | int) * 10, 50] | max -%}
+{%- set vmax = t.v_max | int(0) or vmax_def.get(chem, 4200) -%}
+{%- set vcut = t.v_cut | int(0) or vcut_def.get(chem, 2500) -%}
+{%- if chem == 'LiIon' %}{% set vcut = [vcut, 2500] | max %}{% endif -%}
+{%- set vsto = t.v_store | int(0) or vsto_def.get(chem, 0) -%}
+{%- set t_chg = cap / chg * 60 * 1.5 + 60 -%}
+{%- set t_dis = cap / dis * 60 * 1.3 + 30 -%}
+{%- set tc = t_chg if mode == 'laden' else (t_dis if mode == 'ontladen' else [t_chg, t_dis] | max) -%}
+{%- set tcut = [[((tc / 10) | round(0, 'ceil') | int) * 10, 60] | max, 1440] | min -%}
+{%- set modes = {'laden': 'Charge', 'ontladen': 'Discharge', 'opslag': 'Storage/Break-in', 'cd': 'Cycle', 'cyclus': 'Cycle', 'refresh': 'Refresh', 'capaciteit': 'C>D>Storage'} -%}
+{%- set label = (t.name ~ ((' · ' ~ c.print) if c.print else ''))[:60] -%}
+{{ {'ok': true, 'bt': chem, 'mode': modes.get(mode, 'Charge'),
+    'cycle_mode': 'C>D' if mode == 'cd' else 'C>D>C',
+    'cap': cap, 'caplimit': [((cap * 1.25 / 100) | round(0, 'ceil') | int) * 100, 20000] | min,
+    'chg': chg, 'dis': dis, 'endc': endc, 'dis_end': dis, 'v_max': vmax, 'v_cut': vcut, 'v_store': vsto,
+    'tcut': tcut, 'temp': 45, 'label': label, 'type_name': t.name, 'ir': t.ir | int(0)} | to_json }}
+{%- endif -%}
+{%- endmacro %}
