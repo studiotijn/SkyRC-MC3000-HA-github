@@ -1,7 +1,7 @@
 # SkyRC MC3000 - Home Assistant package
 #
 # Dashboard "Batterijlader" (custom card /local/mc3000/mc3000-card.js) and the
-# test reports (local or GitHub). Parts:
+# GitHub test reports. Parts:
 #   - shell_command: report script /config/py_scripts/mc3000_report.py
 #   - sensor.mc3000_cellen: the cell database (types + variants), written by
 #     the card through script.mc3000_db_opslaan, backed up to
@@ -364,6 +364,19 @@ script:
             {% from 'mc3000.jinja' import mc3000_params %}{{ mc3000_params(cel, program, factor | default(1)) | from_json }}
       - condition: template
         value_template: "{{ p.ok }}"
+      - alias: >-
+          Kanaal eerst naar Standby: na Done of een FAULT negeert de lader een nieuwe start
+          (de ESP stopt alleen een kanaal dat nog loopt)
+        if:
+          - condition: template
+            value_template: "{{ states('sensor.skyrc_mc3000_ch' ~ ch ~ '_status') not in ['Standby', 'unavailable', 'unknown'] }}"
+        then:
+          - action: switch.turn_off
+            target:
+              entity_id: "switch.skyrc_mc3000_ch{{ ch }}_charging"
+          - wait_template: "{{ is_state('sensor.skyrc_mc3000_ch' ~ ch ~ '_status', 'Standby') }}"
+            timeout: 20
+          - delay: 2
       - if:
           - condition: template
             value_template: "{{ states('select.skyrc_mc3000_program_battery_type') != p.bt }}"
@@ -467,7 +480,7 @@ script:
     description: >-
       Intern (automation MC3000 programmaverloop): zet de volgende stap van een kwaliteits- of
       capaciteitstest en voert die uit (lader-stap, rust met timer, IR-test).
-    mode: queued
+    mode: parallel
     max: 20
     fields:
       channel:
@@ -524,23 +537,47 @@ script:
             data:
               timestamp: "{{ (now() + timedelta(minutes=minuten | int)).timestamp() }}"
       - choose:
+          - alias: Lader-stap starten en controleren dat hij echt loopt (2 pogingen, anders afbreken)
+            conditions:
+              - condition: template
+                value_template: "{{ fase in ['laden1', 'laden2', 'ontladen', 'opslag', 'cd'] }}"
+            sequence:
+              - repeat:
+                  sequence:
+                    - action: script.mc3000_toepassen
+                      data:
+                        channel: "{{ ch }}"
+                        program: "{{ 'laden' if fase in ['laden1', 'laden2'] else fase }}"
+                        factor: "{{ n_factor }}"
+                    - wait_template: >-
+                        {{ states('sensor.skyrc_mc3000_ch' ~ ch ~ '_status') in ['Charging', 'Discharging', 'Paused'] }}
+                      timeout: 90
+                  until:
+                    - condition: template
+                      value_template: >-
+                        {{ wait.completed or repeat.index >= 2
+                           or states('input_text.mc3000_ch' ~ ch ~ '_kt').split('|')[0] != fase }}
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ not wait.completed and states('input_text.mc3000_ch' ~ ch ~ '_kt').split('|')[0] == fase }}
+                then:
+                  - action: script.turn_on
+                    target:
+                      entity_id: script.mc3000_kt_rapport
+                    data:
+                      variables:
+                        channel: "{{ ch }}"
+                        outcome: "Stopped (stap {{ fase }} niet gestart: {{ states('sensor.skyrc_mc3000_program_apply_result') | replace(\"'\", '') }})"
+                        eind: afgebroken
           - conditions:
               - condition: template
-                value_template: "{{ fase in ['laden1', 'laden2'] }}"
+                value_template: "{{ fase == 'ir' }}"
             sequence:
               - action: script.mc3000_toepassen
                 data:
                   channel: "{{ ch }}"
-                  program: laden
-                  factor: "{{ n_factor }}"
-          - conditions:
-              - condition: template
-                value_template: "{{ fase in ['ontladen', 'opslag', 'cd', 'ir'] }}"
-            sequence:
-              - action: script.mc3000_toepassen
-                data:
-                  channel: "{{ ch }}"
-                  program: "{{ fase }}"
+                  program: ir
                   factor: "{{ n_factor }}"
 
   mc3000_kt_rapport:
@@ -712,7 +749,7 @@ automation:
                 target:
                   entity_id: "{{ 'script.mc3000_kt_rapport' if volgende == 'rapport' else 'script.mc3000_kt_fase' }}"
                 data:
-                  variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0} }}"
+                  variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0, 'factor': 1} }}"
           # ---------------- timer --------------------------------------
           - alias: Rust/wachttijd voorbij
             conditions:
@@ -772,7 +809,7 @@ automation:
                     target:
                       entity_id: "{{ 'script.mc3000_kt_rapport' if volgende == 'rapport' else 'script.mc3000_kt_fase' }}"
                     data:
-                      variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0} }}"
+                      variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0, 'factor': 1} }}"
           # ---------------- fout van de lader --------------------------
           - alias: Fout tijdens een lader-stap
             conditions:
@@ -851,7 +888,7 @@ automation:
                             target:
                               entity_id: "{{ 'script.mc3000_kt_rapport' if volgende == 'rapport' else 'script.mc3000_kt_fase' }}"
                             data:
-                              variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0} }}"
+                              variables: "{{ {'channel': ch, 'outcome': 'Done'} if volgende == 'rapport' else {'channel': ch, 'fase': volgende, 'poging': 0, 'factor': 1} }}"
                   - alias: Voedingsfout -> 15 min pauze en hervatten (max. 2x)
                     conditions:
                       - condition: template

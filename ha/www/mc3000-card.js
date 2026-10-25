@@ -19,7 +19,7 @@
  * Program values: params() below = custom_templates/mc3000.jinja; keep in step.
  */
 
-const VERSION = "1.0.5";
+const VERSION = "1.0.6";
 const CH = [1, 2, 3, 4];
 const DB = "sensor.mc3000_cellen";
 const PALETTE = ["#e5484d", "#f76b15", "#ffc53d", "#46a758", "#12a594", "#0090ff",
@@ -95,7 +95,7 @@ function params(t, mode, factor = 1) {
   let vcut = parseInt(t.v_cut) || VCUT[chem] || 2500;
   if (chem === "LiIon") vcut = Math.max(vcut, 2500);
   const vsto = parseInt(t.v_store) || VSTO[chem] || 0;
-  const tChg = cap / chg * 60 * 1.5 + 60, tDis = cap / dis * 60 * 1.3 + 30;
+  const tChg = cap / chg * 60 * 2 + 120, tDis = cap / dis * 60 * 1.3 + 30;
   const tc = mode === "laden" ? tChg : mode === "ontladen" ? tDis : Math.max(tChg, tDis);
   const tcut = Math.min(Math.max(Math.ceil(tc / 10) * 10, 60), 1440);
   return { chem, cap, caplimit: Math.min(Math.ceil(cap * 1.25 / 100) * 100, 20000), chg, dis, endc, dis_end: dis,

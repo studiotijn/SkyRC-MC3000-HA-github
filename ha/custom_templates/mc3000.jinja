@@ -5,7 +5,8 @@
       discharge  = 0.2C (IEC 61960 capacity test), 50 mA steps, 0.1-2.0 A
       end current = C/20 (min 50 mA), discharge end current = discharge current
       capacity limit = 1.25 x rated (safety stop, not the cell capacity)
-      time limit = 1.5 x the expected phase time + 1 h (max 24 h)
+      time limit: charge 2 x the CC time + 2 h (aged cells have CV tails of 3 h+),
+                  discharge 1.3 x + 30 min (max 24 h)
     `factor` (0.5-1) lowers both currents, used after a temperature fault. -#}
 {% macro mc3000_params(cell_id, mode, factor=1) -%}
 {%- set db = states.sensor.mc3000_cellen.attributes if states.sensor.mc3000_cellen is not none else {} -%}
@@ -28,7 +29,7 @@
 {%- set vcut = t.v_cut | int(0) or vcut_def.get(chem, 2500) -%}
 {%- if chem == 'LiIon' %}{% set vcut = [vcut, 2500] | max %}{% endif -%}
 {%- set vsto = t.v_store | int(0) or vsto_def.get(chem, 0) -%}
-{%- set t_chg = cap / chg * 60 * 1.5 + 60 -%}
+{%- set t_chg = cap / chg * 60 * 2 + 120 -%}
 {%- set t_dis = cap / dis * 60 * 1.3 + 30 -%}
 {%- set tc = t_chg if mode == 'laden' else (t_dis if mode == 'ontladen' else [t_chg, t_dis] | max) -%}
 {%- set tcut = [[((tc / 10) | round(0, 'ceil') | int) * 10, 60] | max, 1440] | min -%}
